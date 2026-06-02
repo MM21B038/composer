@@ -1,5 +1,4 @@
-from typing import List, Union, Optional, TYPE_CHECKING, get_args
-import asyncio
+from typing import List, Union, Optional, TYPE_CHECKING
 
 from langchain_core.messages import (
     HumanMessage as BaseHumanMessage,
@@ -44,36 +43,6 @@ Message = Union[
 ]
 
 
-class AgentInvoke:
-    __slots__ = ("_agent", "_thread", "_append_to", "_result")
-
-    def __init__(self, agent: "Agent", thread: "Thread", append_to: "Thread"):
-        self._agent = agent
-        self._thread = thread
-        self._append_to = append_to
-        self._result: Optional[AIMessage] = None
-
-    def __await__(self):
-        return self._agent.ainvoke(
-            self._thread, append_to=self._append_to
-        ).__await__()
-
-    def resolve(self) -> AIMessage:
-        if self._result is None:
-            self._result = self._agent.invoke(
-                self._thread, append_to=self._append_to
-            )
-        return self._result
-
-    def __getattr__(self, name: str):
-        return getattr(self.resolve(), name)
-
-    def __repr__(self) -> str:
-        if self._result is not None:
-            return repr(self._result)
-        return "<AgentInvoke pending>"
-
-
 class Thread:
     def __init__(
         self,
@@ -84,12 +53,9 @@ class Thread:
         self.auto_append_ai_message = auto_append_ai_message
 
     def copy(self):
-        return Thread(
-            self.thread.copy(),
-            auto_append_ai_message=self.auto_append_ai_message,
-        )
+        return Thread(self.thread.copy())
 
-    def append(self, message: Message):
+    def add_message(self, message: Message):
         if (
             isinstance(message, SystemMessage)
             and self.thread
@@ -131,11 +97,6 @@ class Thread:
     def clear_thread(self):
         self.thread = []
 
-    def pop(self, index):
-        return self.thread.pop(index)
-        
-        
-
     # -------------------------
     # Operators
     # -------------------------
@@ -144,59 +105,53 @@ class Thread:
         new_thread = self.copy()
 
         for message in other.get_messages():
-            new_thread.append(message)
+            new_thread.add_message(message)
 
         return new_thread
 
     def __or__(
         self,
         other: Union[
+            Message,
+            "Thread",
             "Agent",
         ],
     ):
         from .agent import Agent
 
-        if isinstance(other, Thread):
-            raise TypeError(
-                "Use + to combine threads (thread_a + thread_b), not |"
-            )
+        new_thread = self.copy()
 
-        if isinstance(other, get_args(Message)):
-            raise TypeError(
-                "Use message | thread to append a message, not thread | message"
-            )
+        if isinstance(other, Thread):
+            return new_thread + other
 
         if isinstance(other, Agent):
-            new_thread = self.copy()
-            pending = AgentInvoke(other, new_thread, self)
-            try:
-                asyncio.get_running_loop()
-            except RuntimeError:
-                return pending.resolve()
-            return pending
+            ai_message = other(new_thread)
+            if self.auto_append_ai_message and isinstance(ai_message, AIMessage):
+                self.thread.add_message(ai_message)
+            return ai_message
 
-        raise TypeError(f"Unsupported operand for |: Thread and {type(other).__name__}")
+        new_thread.add_message(other)
+
+        return new_thread
 
     def __ror__(self, other):
         from .agent import Agent
 
-        if isinstance(other, Thread):
-            raise TypeError(
-                "Use + to combine threads (thread_a + thread_b), not |"
-            )
+        new_thread = self.copy()
 
-        if isinstance(other, get_args(Message)):
-            self.append(other)
-            return self
+        if isinstance(other, Thread):
+            return other + new_thread
+
+        if isinstance(other, Message.__args__):
+            temp = Thread()
+            temp.add_message(other)
+            return temp + new_thread
 
         if isinstance(other, Agent):
-            new_thread = self.copy()
-            pending = AgentInvoke(other, new_thread, self)
-            try:
-                asyncio.get_running_loop()
-            except RuntimeError:
-                return pending.resolve()
-            return pending
+            ai_message = other(new_thread)
+            if self.auto_append_ai_message and isinstance(ai_message, AIMessage):
+                self.thread.add_message(ai_message)
+            return ai_message
 
         return NotImplemented
 
@@ -214,11 +169,6 @@ class Thread:
     # -------------------------
 
     def __getitem__(self, index):
-        if isinstance(index, slice):
-            return Thread(
-                self.thread[index],
-                auto_append_ai_message=self.auto_append_ai_message,
-            )
         return self.thread[index]
 
     def __len__(self):
