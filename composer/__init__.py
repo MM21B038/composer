@@ -1,4 +1,4 @@
-"""Paneer — thread-based agents with typed streaming."""
+"""Composer — thread-based agents with typed streaming."""
 
 from .agent import (
     Agent,
@@ -16,6 +16,7 @@ from .agent import (
     extract_thinking,
     extract_assistant_text,
 )
+from .vector import Vector
 from .thread import (
     Thread,
     HumanMessage,
@@ -29,6 +30,7 @@ from .thread import (
 
 __all__ = [
     "Agent",
+    "Vector",
     "MCPClient",
     "Thread",
     "HumanMessage",

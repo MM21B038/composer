@@ -1,4 +1,4 @@
-"""Paneer — thread-based agents with typed streaming."""
+"""Composer — thread-based agents with typed streaming."""
 
 from .agent import (
     Agent,

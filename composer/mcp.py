@@ -7,7 +7,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 
 
 class MCPClient:
-    """Paneer wrapper around MultiServerMCPClient — use server config dicts, not raw JSON blobs."""
+    """Composer wrapper around MultiServerMCPClient — use server config dicts, not raw JSON blobs."""
 
     def __init__(
         self,

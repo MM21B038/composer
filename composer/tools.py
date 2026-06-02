@@ -9,7 +9,7 @@ from langchain_core.tools import BaseTool
 
 @dataclass
 class ToolCall:
-    """Model-initiated tool invocation (paneer type, not a JSON blob)."""
+    """Model-initiated tool invocation (composer type, not a JSON blob)."""
 
     name: str
     args: Dict[str, Any] = field(default_factory=dict)

@@ -1,4 +1,4 @@
-"""Backward-compatible re-exports — prefer paneer.stream."""
+"""Backward-compatible re-exports — prefer composer.stream."""
 
 from .stream import (
     AssistantEvent,
