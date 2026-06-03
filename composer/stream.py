@@ -72,6 +72,57 @@ class ToolResultEvent:
 StreamEvent = Union[ThinkingEvent, AssistantEvent, ToolCallEvent, ToolResultEvent]
 StreamEventKind = Literal["thinking", "assistant", "tool_call", "tool_result"]
 
+_KNOWN_FINISH_REASONS = frozenset(
+    {"stop", "length", "tool_calls", "content_filter", "function_call"}
+)
+_RESPONSE_METADATA_STRING_FIELDS = frozenset(
+    {"finish_reason", "model_name", "model", "id", "system_fingerprint"}
+)
+
+
+def dedupe_repeated_string(value: str) -> str:
+    """Undo langchain merge_dicts concatenation when chunks repeat the same value."""
+    if not value:
+        return value
+    length = len(value)
+    for size in range(1, length // 2 + 1):
+        if length % size != 0:
+            continue
+        base = value[:size]
+        if base * (length // size) == value:
+            return base
+    return value
+
+
+def normalize_finish_reason(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return value
+    if value in _KNOWN_FINISH_REASONS:
+        return value
+    deduped = dedupe_repeated_string(value)
+    if deduped in _KNOWN_FINISH_REASONS:
+        return deduped
+    for reason in sorted(_KNOWN_FINISH_REASONS, key=len, reverse=True):
+        if deduped.endswith(reason):
+            return reason
+    return deduped
+
+
+def normalize_response_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Fix response_metadata corrupted by AIMessageChunk accumulation."""
+    if not metadata:
+        return {}
+    out = dict(metadata)
+    for key in _RESPONSE_METADATA_STRING_FIELDS:
+        val = out.get(key)
+        if not isinstance(val, str):
+            continue
+        if key == "finish_reason":
+            out[key] = normalize_finish_reason(val)
+        else:
+            out[key] = dedupe_repeated_string(val)
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Processor
@@ -109,8 +160,8 @@ class StreamEventProcessor:
         events.extend(self._thinking_delta_events(message, meta))
         events.extend(self._assistant_delta_events(message, meta))
 
-        finish_reason = (getattr(message, "response_metadata", None) or {}).get(
-            "finish_reason"
+        finish_reason = normalize_finish_reason(
+            (getattr(message, "response_metadata", None) or {}).get("finish_reason")
         )
         if finish_reason == "tool_calls":
             events.extend(self._tool_call_events_from_message(message, meta))

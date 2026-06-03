@@ -76,6 +76,53 @@ def _parse_args_string(raw: str) -> Dict[str, Any]:
         return {"raw": raw}
 
 
+def format_tool_output(result: Any) -> str:
+    """Normalize LangChain tool return values to a string."""
+    if isinstance(result, str):
+        return result
+    if isinstance(result, (dict, list)):
+        return json.dumps(result, default=str)
+    return str(result)
+
+
+def tools_by_name(tools: List[BaseTool]) -> Dict[str, BaseTool]:
+    return {tool.name: tool for tool in tools}
+
+
+def lookup_tool(name: str, tools: List[BaseTool]) -> BaseTool:
+    by_name = tools_by_name(tools)
+    if name not in by_name:
+        available = ", ".join(sorted(by_name))
+        raise KeyError(f"Tool {name!r} not found. Available: {available}")
+    return by_name[name]
+
+
+async def invoke_tool(tool: BaseTool, args: Dict[str, Any]) -> str:
+    """Run one LangChain tool and return string content."""
+    try:
+        if hasattr(tool, "ainvoke"):
+            output = await tool.ainvoke(args)
+        else:
+            output = tool.invoke(args)
+    except Exception as exc:
+        return f"Tool execution failed: {exc}"
+    return format_tool_output(output)
+
+
+async def run_tool_call(
+    call: ToolCall,
+    tools: List[BaseTool],
+) -> ToolResult:
+    """Execute a ToolCall against a resolved tool list; returns ToolResult."""
+    tool = lookup_tool(call.name, tools)
+    content = await invoke_tool(tool, call.args)
+    return ToolResult(
+        content=content,
+        tool_call_id=call.id,
+        name=call.name,
+    )
+
+
 async def combine_tools(*sources: Any) -> List[BaseTool]:
     """Merge local tools and MCPClient-loaded tools into one LangChain tool list."""
     from .mcp import MCPClient

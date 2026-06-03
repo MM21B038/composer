@@ -309,6 +309,7 @@ dependencies = [
     { name = "langchain-mcp-adapters" },
     { name = "langchain-openai" },
     { name = "langgraph" },
+    { name = "tiktoken" },
 ]
 
 [package.metadata]
@@ -322,6 +323,7 @@ requires-dist = [
     { name = "langchain-mcp-adapters", specifier = ">=0.2.2" },
     { name = "langchain-openai", specifier = ">=1.2.1" },
     { name = "langgraph", specifier = ">=1.2.0" },
+    { name = "tiktoken", specifier = ">=0.13.0" },
 ]
 
 [[package]]

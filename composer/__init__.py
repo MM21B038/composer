@@ -3,6 +3,8 @@
 from .agent import (
     Agent,
     MCPClient,
+    MCPPromptInfo,
+    MCPResourceInfo,
     StreamEvent,
     StreamEventKind,
     StreamEventProcessor,
@@ -16,6 +18,7 @@ from .agent import (
     extract_thinking,
     extract_assistant_text,
 )
+from .tools import run_tool_call
 from .vector import Vector
 from .thread import (
     Thread,
@@ -26,12 +29,16 @@ from .thread import (
     CompressedMessage,
     UpdateMessage,
     Message,
+    EncoderType,
+    TokenCalculator,
 )
 
 __all__ = [
     "Agent",
     "Vector",
     "MCPClient",
+    "MCPPromptInfo",
+    "MCPResourceInfo",
     "Thread",
     "HumanMessage",
     "AIMessage",
@@ -40,6 +47,8 @@ __all__ = [
     "CompressedMessage",
     "UpdateMessage",
     "Message",
+    "EncoderType",
+    "TokenCalculator",
     "ThinkingEvent",
     "AssistantEvent",
     "ToolCallEvent",
@@ -50,6 +59,7 @@ __all__ = [
     "ToolCall",
     "ToolResult",
     "combine_tools",
+    "run_tool_call",
     "extract_thinking",
     "extract_assistant_text",
 ]

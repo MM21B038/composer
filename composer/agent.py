@@ -10,7 +10,7 @@ from langchain_core.messages.ai import AIMessageChunk
 from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
 
-from .mcp import MCPClient
+from .mcp import MCPClient, MCPPromptInfo, MCPResourceInfo
 from .stream import (
     AssistantEvent,
     StreamEvent,
@@ -21,6 +21,7 @@ from .stream import (
     ToolResultEvent,
     extract_assistant_text,
     extract_thinking,
+    normalize_response_metadata,
     parse_langgraph_chunk,
 )
 from .thread import (
@@ -30,7 +31,7 @@ from .thread import (
     ToolMessage,
     Thread,
 )
-from .tools import ToolCall, ToolResult, combine_tools
+from .tools import ToolCall, ToolResult, combine_tools, run_tool_call as _run_tool_call
 import os
 
 os.environ["LANGCHAIN_TRACING_V2"] = "false"
@@ -51,6 +52,8 @@ class Agent:
         system_prompt: Optional[str] = None,
         tools: Optional[List] = None,
         reasoning: Optional[Union[bool, Dict[str, Any]]] = None,
+        *,
+        auto_tool_call: bool = True,
     ):
         self.provider = provider
         self.model = model
@@ -59,6 +62,7 @@ class Agent:
         self.base_url = base_url
         self.api_key = api_key
         self.reasoning = reasoning
+        self.auto_tool_call = auto_tool_call
 
     def _prepare_messages(self, thread: Thread):
         messages = thread.get_messages()
@@ -106,7 +110,7 @@ class Agent:
         if isinstance(tools, MCPClient):
             if not tools.loaded:
                 raise RuntimeError(
-                    "MCPClient tools not loaded. Call: await mcp.load() first, "
+                    "MCPClient tools not loaded. Call: await mcp.load_tools() first, "
                     "or use await agent.ainvoke(...) / await agent.astream_events(...) "
                     "which loads MCP tools automatically."
                 )
@@ -136,6 +140,48 @@ class Agent:
         if func is not None and inspect.iscoroutinefunction(func):
             return True
         return False
+
+    def _coerce_tool_call(self, call: Union[ToolCall, ToolCallEvent]) -> ToolCall:
+        if isinstance(call, ToolCall):
+            return call
+        if isinstance(call, ToolCallEvent):
+            return call.call
+        raise TypeError(
+            f"Expected ToolCall or ToolCallEvent, got {type(call).__name__}"
+        )
+
+    async def arun_tool_call(
+        self,
+        call: Union[ToolCall, ToolCallEvent],
+        *,
+        tools: Optional[List] = None,
+        thread: Optional[Thread] = None,
+    ) -> ToolResult:
+        """Run one tool call and return its result (`.content` is the output text)."""
+        tool_call = self._coerce_tool_call(call)
+        langchain_tools = await self._resolve_tools_async(tools)
+        result = await _run_tool_call(tool_call, langchain_tools)
+        if thread is not None and thread.auto_append_tool_results:
+            thread.append(
+                ToolMessage(
+                    content=result.content,
+                    tool_call_id=result.tool_call_id or tool_call.id,
+                    name=result.name or tool_call.name,
+                )
+            )
+        return result
+
+    def run_tool_call(
+        self,
+        call: Union[ToolCall, ToolCallEvent],
+        *,
+        tools: Optional[List] = None,
+        thread: Optional[Thread] = None,
+    ) -> ToolResult:
+        """Sync wrapper for arun_tool_call."""
+        return self._sync_run_async(
+            self.arun_tool_call(call, tools=tools, thread=thread)
+        )
 
     def _tools_need_async(self, tools: Optional[Any] = None) -> bool:
         raw = self.tools if tools is None else tools
@@ -224,35 +270,73 @@ class Agent:
         if in_running_loop:
             thread.join(timeout=1)
 
-    def _build_agent(self, langchain_tools: List[BaseTool]):
+    def _build_agent(
+        self,
+        langchain_tools: List[BaseTool],
+        *,
+        auto_tool_call: Optional[bool] = None,
+    ):
+        run_tools = self.auto_tool_call if auto_tool_call is None else auto_tool_call
         return create_agent(
             model=self._get_model(),
             tools=langchain_tools,
             system_prompt=self.system_prompt,
+            interrupt_before=None if run_tools else ["tools"],
         )
 
-    def _get_agent(self, tools: Optional[List] = None):
-        return self._build_agent(self._resolve_tools(tools))
+    def _get_agent(
+        self,
+        tools: Optional[List] = None,
+        *,
+        auto_tool_call: Optional[bool] = None,
+    ):
+        return self._build_agent(
+            self._resolve_tools(tools),
+            auto_tool_call=auto_tool_call,
+        )
 
-    async def _aget_agent(self, tools: Optional[List] = None):
-        return self._build_agent(await self._resolve_tools_async(tools))
+    async def _aget_agent(
+        self,
+        tools: Optional[List] = None,
+        *,
+        auto_tool_call: Optional[bool] = None,
+    ):
+        return self._build_agent(
+            await self._resolve_tools_async(tools),
+            auto_tool_call=auto_tool_call,
+        )
 
 
     def _to_ai_message(self, message) -> AIMessage:
         if isinstance(message, AIMessage) and not isinstance(message, AIMessageChunk):
+            if message.response_metadata:
+                normalized = normalize_response_metadata(message.response_metadata)
+                if normalized != message.response_metadata:
+                    dump = message.model_dump()
+                    dump["response_metadata"] = normalized
+                    return AIMessage.model_validate(dump)
             return message
         dump = message.model_dump()
         if dump.get("type") == "AIMessageChunk":
             dump["type"] = "ai"
+        if dump.get("response_metadata"):
+            dump["response_metadata"] = normalize_response_metadata(
+                dump["response_metadata"]
+            )
         return AIMessage.model_validate(dump)
 
     def _to_thread_message(self, message) -> Union[HumanMessage, AIMessage, SystemMessage, ToolMessage]:
         if isinstance(message, (HumanMessage, AIMessage, SystemMessage, ToolMessage)):
             if isinstance(message, AIMessageChunk):
                 return self._to_ai_message(message)
+            if isinstance(message, AIMessage):
+                return self._to_ai_message(message)
             return message
 
         msg_type = getattr(message, "type", None)
+        if msg_type == "ai":
+            return self._to_ai_message(message)
+
         dump = message.model_dump()
         if msg_type == "ai" and dump.get("type") in ("AIMessageChunk",):
             dump["type"] = "ai"
@@ -268,16 +352,27 @@ class Agent:
             raise ValueError(f"Unsupported message type: {msg_type!r}")
         return cls.model_validate(dump)
 
+    def _should_append_message(self, thread: Thread, message: Any) -> bool:
+        thread_message = self._to_thread_message(message)
+        if isinstance(thread_message, ToolMessage):
+            return thread.auto_append_tool_results
+        if isinstance(thread_message, AIMessage):
+            if thread_message.tool_calls:
+                return thread.auto_append_tool_calls
+            return thread.auto_append_ai_message
+        return True
+
     def _append_new_messages(
         self,
         thread: Thread,
         input_messages: Sequence[Any],
         output_messages: Sequence[Any],
     ) -> None:
-        if not thread.auto_append_ai_message:
+        if not thread.appends_agent_messages():
             return
         for message in output_messages[len(input_messages) :]:
-            thread.append(self._to_thread_message(message))
+            if self._should_append_message(thread, message):
+                thread.append(self._to_thread_message(message))
 
     def _apply_stream_metadata(
         self,
@@ -291,7 +386,9 @@ class Agent:
 
         dump = ai_message.model_dump()
         if metadata_source.response_metadata:
-            dump["response_metadata"] = metadata_source.response_metadata
+            dump["response_metadata"] = normalize_response_metadata(
+                metadata_source.response_metadata
+            )
         if metadata_source.usage_metadata:
             dump["usage_metadata"] = metadata_source.usage_metadata
         if metadata_source.additional_kwargs:
@@ -396,7 +493,7 @@ class Agent:
             last_stream_chunk,
             last_finish_chunk,
         )
-        if ai_message is not None and target.auto_append_ai_message:
+        if ai_message is not None and self._should_append_message(target, ai_message):
             target.append(ai_message)
 
     def _resolve_stream_result(
@@ -422,8 +519,14 @@ class Agent:
         *,
         append_to: Optional[Thread] = None,
         tools: Optional[List] = None,
+        auto_tool_call: Optional[bool] = None,
     ):
-        return self.invoke(thread, append_to=append_to, tools=tools)
+        return self.invoke(
+            thread,
+            append_to=append_to,
+            tools=tools,
+            auto_tool_call=auto_tool_call,
+        )
 
     def invoke(
         self,
@@ -431,13 +534,19 @@ class Agent:
         *,
         append_to: Optional[Thread] = None,
         tools: Optional[List] = None,
+        auto_tool_call: Optional[bool] = None,
     ):
         if self._tools_need_async(tools):
             return self._sync_run_async(
-                self.ainvoke(thread, append_to=append_to, tools=tools)
+                self.ainvoke(
+                    thread,
+                    append_to=append_to,
+                    tools=tools,
+                    auto_tool_call=auto_tool_call,
+                )
             )
 
-        agent = self._get_agent(tools)
+        agent = self._get_agent(tools, auto_tool_call=auto_tool_call)
         input_messages = self._prepare_messages(thread)
 
         response = agent.invoke({"messages": input_messages})
@@ -451,8 +560,9 @@ class Agent:
         *,
         append_to: Optional[Thread] = None,
         tools: Optional[List] = None,
+        auto_tool_call: Optional[bool] = None,
     ):
-        agent = await self._aget_agent(tools)
+        agent = await self._aget_agent(tools, auto_tool_call=auto_tool_call)
         input_messages = self._prepare_messages(thread)
 
         response = await agent.ainvoke({"messages": input_messages})
@@ -525,10 +635,14 @@ class Agent:
         *,
         append_to: Optional[Thread] = None,
         tools: Optional[List] = None,
+        auto_tool_call: Optional[bool] = None,
     ) -> Iterator:
         if stream_mode == "events":
             yield from self.stream_events(
-                thread, append_to=append_to, tools=tools
+                thread,
+                append_to=append_to,
+                tools=tools,
+                auto_tool_call=auto_tool_call,
             )
             return
 
@@ -539,11 +653,12 @@ class Agent:
                     stream_mode=stream_mode,
                     append_to=append_to,
                     tools=tools,
+                    auto_tool_call=auto_tool_call,
                 )
             )
             return
 
-        agent = self._get_agent(tools)
+        agent = self._get_agent(tools, auto_tool_call=auto_tool_call)
         input_messages = self._prepare_messages(thread)
         internal_mode, filter_messages_only = self._stream_modes(stream_mode)
         accumulated: Optional[AIMessageChunk] = None
@@ -593,17 +708,21 @@ class Agent:
         *,
         append_to: Optional[Thread] = None,
         tools: Optional[List] = None,
+        auto_tool_call: Optional[bool] = None,
     ) -> Iterator[StreamEvent]:
         """Stream typed events: thinking, assistant, tool_call, tool_result."""
         if self._tools_need_async(tools):
             yield from self._sync_iterate_asyncgen(
                 lambda: self.astream_events(
-                    thread, append_to=append_to, tools=tools
+                    thread,
+                    append_to=append_to,
+                    tools=tools,
+                    auto_tool_call=auto_tool_call,
                 )
             )
             return
 
-        agent = self._get_agent(tools)
+        agent = self._get_agent(tools, auto_tool_call=auto_tool_call)
         input_messages = self._prepare_messages(thread)
         internal_mode = self._events_stream_modes()
         accumulated: Optional[AIMessageChunk] = None
@@ -653,15 +772,19 @@ class Agent:
         *,
         append_to: Optional[Thread] = None,
         tools: Optional[List] = None,
+        auto_tool_call: Optional[bool] = None,
     ) -> AsyncIterator:
         if stream_mode == "events":
             async for event in self.astream_events(
-                thread, append_to=append_to, tools=tools
+                thread,
+                append_to=append_to,
+                tools=tools,
+                auto_tool_call=auto_tool_call,
             ):
                 yield event
             return
 
-        agent = self._get_agent(tools)
+        agent = await self._aget_agent(tools, auto_tool_call=auto_tool_call)
         input_messages = self._prepare_messages(thread)
         internal_mode, filter_messages_only = self._stream_modes(stream_mode)
         accumulated: Optional[AIMessageChunk] = None
@@ -711,9 +834,10 @@ class Agent:
         *,
         append_to: Optional[Thread] = None,
         tools: Optional[List] = None,
+        auto_tool_call: Optional[bool] = None,
     ) -> AsyncIterator[StreamEvent]:
         """Async stream of typed events: thinking, assistant, tool_call, tool_result."""
-        agent = await self._aget_agent(tools)
+        agent = await self._aget_agent(tools, auto_tool_call=auto_tool_call)
         input_messages = self._prepare_messages(thread)
         internal_mode = self._events_stream_modes()
         accumulated: Optional[AIMessageChunk] = None
@@ -761,6 +885,8 @@ class Agent:
 __all__ = [
     "Agent",
     "MCPClient",
+    "MCPPromptInfo",
+    "MCPResourceInfo",
     "ToolCall",
     "ToolResult",
     "combine_tools",

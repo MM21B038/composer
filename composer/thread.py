@@ -1,5 +1,9 @@
-from typing import List, Union, Optional, TYPE_CHECKING, get_args
+from typing import List, Union, Optional, TYPE_CHECKING, get_args, Literal
 import asyncio
+import json
+
+import tiktoken
+from tiktoken.core import Encoding
 
 from langchain_core.messages import (
     HumanMessage as BaseHumanMessage,
@@ -43,6 +47,89 @@ Message = Union[
     UpdateMessage,
 ]
 
+EncoderType = Literal[
+    "gpt2",
+    "r50k_base",
+    "p50k_base",
+    "p50k_edit",
+    "cl100k_base",
+    "o200k_base",
+    "o200k_harmony",
+]
+
+_encoders: dict[EncoderType, Encoding] = {}
+
+
+def _get_encoder(encoder: EncoderType) -> Encoding:
+    if encoder not in _encoders:
+        _encoders[encoder] = tiktoken.get_encoding(encoder)
+    return _encoders[encoder]
+
+
+def _content_to_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+                else:
+                    parts.append(json.dumps(block, default=str))
+            else:
+                parts.append(str(block))
+        return "\n".join(parts)
+    return str(content)
+
+
+def _message_to_text(message: Message) -> str:
+    parts = [_content_to_text(message.content)]
+    if isinstance(message, AIMessage) and message.tool_calls:
+        parts.append(json.dumps(message.tool_calls, default=str))
+    if isinstance(message, ToolMessage) and message.tool_call_id:
+        parts.append(message.tool_call_id)
+    return "\n".join(parts)
+
+
+class TokenCalculator:
+    def __init__(self, encoder: EncoderType = "cl100k_base"):
+        self.encoder = encoder
+        self._enc = _get_encoder(encoder)
+
+    def count_message(self, message: Message) -> int:
+        return len(self._enc.encode(_message_to_text(message)))
+
+    def count(self, messages: List[Message]) -> int:
+        return sum(self.count_message(message) for message in messages)
+
+    def counts(self, messages: List[Message]) -> List[int]:
+        return [self.count_message(message) for message in messages]
+
+    @classmethod
+    def count_messages(
+        cls,
+        messages: Union["Thread", List[Message]],
+        encoder: EncoderType = "cl100k_base",
+    ) -> int:
+        return cls(encoder).count(cls._resolve_messages(messages))
+
+    @classmethod
+    def message_counts(
+        cls,
+        messages: Union["Thread", List[Message]],
+        encoder: EncoderType = "cl100k_base",
+    ) -> List[int]:
+        return cls(encoder).counts(cls._resolve_messages(messages))
+
+    @staticmethod
+    def _resolve_messages(messages: Union["Thread", List[Message]]) -> List[Message]:
+        if isinstance(messages, Thread):
+            return messages.thread
+        return messages
+
 
 class AgentInvoke:
     __slots__ = ("_agent", "_thread", "_append_to", "_result")
@@ -78,15 +165,29 @@ class Thread:
     def __init__(
         self,
         thread: Optional[List[Message]] = None,
-        auto_append_ai_message = True
+        *,
+        auto_append_ai_message: bool = True,
+        auto_append_tool_calls: bool = True,
+        auto_append_tool_results: bool = True,
     ):
         self.thread = thread or []
         self.auto_append_ai_message = auto_append_ai_message
+        self.auto_append_tool_calls = auto_append_tool_calls
+        self.auto_append_tool_results = auto_append_tool_results
 
     def copy(self):
         return Thread(
             self.thread.copy(),
             auto_append_ai_message=self.auto_append_ai_message,
+            auto_append_tool_calls=self.auto_append_tool_calls,
+            auto_append_tool_results=self.auto_append_tool_results,
+        )
+
+    def appends_agent_messages(self) -> bool:
+        return (
+            self.auto_append_ai_message
+            or self.auto_append_tool_calls
+            or self.auto_append_tool_results
         )
 
     def append(self, message: Message):
@@ -133,8 +234,18 @@ class Thread:
 
     def pop(self, index):
         return self.thread.pop(index)
-        
-        
+
+    def token_count(
+        self,
+        encoder: EncoderType = "cl100k_base",
+    ) -> int:
+        return TokenCalculator.count_messages(self, encoder)
+
+    def token_counts(
+        self,
+        encoder: EncoderType = "cl100k_base",
+    ) -> List[int]:
+        return TokenCalculator.message_counts(self, encoder)
 
     # -------------------------
     # Operators
@@ -218,6 +329,8 @@ class Thread:
             return Thread(
                 self.thread[index],
                 auto_append_ai_message=self.auto_append_ai_message,
+                auto_append_tool_calls=self.auto_append_tool_calls,
+                auto_append_tool_results=self.auto_append_tool_results,
             )
         return self.thread[index]
 
