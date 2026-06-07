@@ -24,6 +24,6 @@ dependencies = [
 ]
 
 [tool.pytest.ini_options]
-DJANGO_SETTINGS_MODULE = "paneer_site.settings"
+DJANGO_SETTINGS_MODULE = "composer_site.settings"
 pythonpath = ["."]
 testpaths = ["tests"]

@@ -7,6 +7,6 @@ from django.conf import settings
 
 
 def ensure_django() -> None:
-    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paneer_site.settings")
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "composer_site.settings")
     if not settings.configured:
         django.setup()

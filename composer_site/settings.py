@@ -2,7 +2,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = "django-insecure-paneer-dev-only-change-in-production"
+SECRET_KEY = "django-insecure-composer-dev-only-change-in-production"
 
 DEBUG = True
 
@@ -16,11 +16,11 @@ INSTALLED_APPS = [
 
 MIDDLEWARE: list[str] = []
 
-ROOT_URLCONF = "paneer_site.urls"
+ROOT_URLCONF = "composer_site.urls"
 
 TEMPLATES: list[dict] = []
 
-WSGI_APPLICATION = "paneer_site.wsgi.application"
+WSGI_APPLICATION = "composer_site.wsgi.application"
 
 DATABASES = {
     "default": {

@@ -19,7 +19,7 @@ Django is bootstrapped automatically when you call `ChatProject` / `ChatSession`
 
 | Concept | Description |
 |---------|-------------|
-| **Project** | A named container (e.g. `paneer-backend`, `my-app`). Holds many sessions. |
+| **Project** | A named container (e.g. `my-backend`, `my-app`). Holds many sessions. |
 | **Session** | One conversation. Stores root messages, thread config, and the full branch graph. |
 | **Root thread** | Canonical message history. All agent replies append here. |
 | **Branch graph** | Compressed context windows. Summaries stay on branch nodes, not in root storage. |
@@ -33,7 +33,7 @@ from composer import Agent, ChatProject, ChatSession, HumanMessage, SystemMessag
 agent = Agent(model="...", base_url="...", api_key="...")
 
 # Create a project and session
-project = ChatProject.create("paneer-backend")
+project = ChatProject.create("my-backend")
 session = project.new_session(
     name="auth-debug",
     compression_prompt="Summarize the conversation so far for continuation.",
