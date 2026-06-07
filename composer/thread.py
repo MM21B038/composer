@@ -27,11 +27,13 @@ from .tool_hide import (
     is_hidden_for_model,
     persist_tool_hide_rules,
     restore_hidden_tool_messages,
+    split_hide_rules_by_mode,
     trim_messages_to_token_budget,
 )
 
 if TYPE_CHECKING:
     from .agent import Agent
+    from .thread_branch import ThreadBranchGraph
 
 
 class _AttachDescriptor:
@@ -79,6 +81,7 @@ class SystemMessage(BaseSystemMessage):
 
 class ToolMessage(BaseToolMessage):
     pass
+
 
 class CompressedMessage(BaseHumanMessage):
     pass
@@ -178,20 +181,38 @@ class TokenCalculator:
 
 
 class AgentInvoke:
-    __slots__ = ("_agent", "_thread", "_append_to", "_result")
+    __slots__ = ("_agent", "_thread", "_append_to", "_branch", "_prepared", "_result")
 
-    def __init__(self, agent: "Agent", thread: "Thread", append_to: "Thread"):
+    def __init__(
+        self,
+        agent: "Agent",
+        thread: "Thread",
+        append_to: "Thread",
+        branch: Optional["ThreadBranchGraph"] = None,
+    ):
         self._agent = agent
         self._thread = thread
         self._append_to = append_to
+        self._branch = branch
+        self._prepared = False
         self._result: Optional[AIMessage] = None
 
+    def _prepare(self) -> None:
+        if self._prepared:
+            return
+        if self._branch is not None:
+            self._branch.maybe_compress(self._agent)
+            self._thread = self._branch.active_view().copy()
+        self._prepared = True
+
     def __await__(self):
+        self._prepare()
         return self._agent.ainvoke(
             self._thread, append_to=self._append_to
         ).__await__()
 
     def resolve(self) -> AIMessage:
+        self._prepare()
         if self._result is None:
             self._result = self._agent.invoke(
                 self._thread, append_to=self._append_to
@@ -220,6 +241,10 @@ class Thread:
         max_messages_for_model: Optional[int] = None,
         max_tokens_for_model: Optional[int] = None,
         model_view_encoder: EncoderType = "cl100k_base",
+        compression_prompt: Optional[str] = None,
+        compression_max_tokens: int = 96_000,
+        compression_tail_tokens: Optional[int] = 8_000,
+        compression_tail_messages: Optional[int] = None,
     ):
         self.thread = thread or []
         self.auto_append_ai_message = auto_append_ai_message
@@ -230,6 +255,26 @@ class Thread:
         self.max_messages_for_model = max_messages_for_model
         self.max_tokens_for_model = max_tokens_for_model
         self.model_view_encoder = model_view_encoder
+        self.compression_prompt = compression_prompt
+        self.compression_max_tokens = compression_max_tokens
+        self.compression_tail_tokens = compression_tail_tokens
+        self.compression_tail_messages = compression_tail_messages
+        self._branch_graph: Optional["ThreadBranchGraph"] = None
+
+    @property
+    def branch(self) -> "ThreadBranchGraph":
+        if self._branch_graph is None:
+            from .thread_branch import ThreadBranchGraph
+
+            self._branch_graph = ThreadBranchGraph(
+                self,
+                compression_prompt=self.compression_prompt,
+                compression_max_tokens=self.compression_max_tokens,
+                compression_tail_tokens=self.compression_tail_tokens,
+                compression_tail_messages=self.compression_tail_messages,
+                encoder=self.model_view_encoder,
+            )
+        return self._branch_graph
 
     def _thread_kwargs(self) -> dict:
         return {
@@ -241,14 +286,32 @@ class Thread:
             "max_messages_for_model": self.max_messages_for_model,
             "max_tokens_for_model": self.max_tokens_for_model,
             "model_view_encoder": self.model_view_encoder,
+            "compression_prompt": self.compression_prompt,
+            "compression_max_tokens": self.compression_max_tokens,
+            "compression_tail_tokens": self.compression_tail_tokens,
+            "compression_tail_messages": self.compression_tail_messages,
         }
 
     def copy(self):
         return Thread(self.thread.copy(), **self._thread_kwargs())
 
+    def _persist_hide_rules(self) -> List[ToolResultHideRule]:
+        _, persist_rules = split_hide_rules_by_mode(
+            self.tool_hide_rules,
+            self.persist_tool_hides,
+        )
+        return persist_rules
+
+    def _invoke_hide_rules(self) -> List[ToolResultHideRule]:
+        invoke_rules, _ = split_hide_rules_by_mode(
+            self.tool_hide_rules,
+            self.persist_tool_hides,
+        )
+        return invoke_rules
+
     def add_tool_hide_rule(self, rule: ToolResultHideRule) -> None:
         self.tool_hide_rules.append(rule)
-        if self.persist_tool_hides:
+        if self._persist_hide_rules():
             self.apply_tool_hide_rules(retroactive=True)
 
     def remove_tool_hide_rule(
@@ -268,8 +331,9 @@ class Thread:
     def apply_tool_hide_rules(self, *, retroactive: bool = True) -> None:
         if not retroactive or not self.tool_hide_rules:
             return
-        if self.persist_tool_hides:
-            persist_tool_hide_rules(self.thread, self.tool_hide_rules)
+        persist_rules = self._persist_hide_rules()
+        if persist_rules:
+            persist_tool_hide_rules(self.thread, persist_rules)
 
     def messages_for_model(
         self,
@@ -280,9 +344,10 @@ class Thread:
     ) -> List[Message]:
         """Collapsed view of thread messages for LLM context."""
         enc = encoder or self.model_view_encoder
+        invoke_rules = self._invoke_hide_rules()
         messages = apply_tool_hide_rules_to_messages(
             self.thread,
-            self.tool_hide_rules,
+            invoke_rules,
             persist=False,
         )
 
@@ -330,7 +395,7 @@ class Thread:
 
         else:
             self.thread.append(message)
-            if isinstance(message, ToolMessage) and self.persist_tool_hides:
+            if isinstance(message, ToolMessage) and self._persist_hide_rules():
                 self.apply_tool_hide_rules(retroactive=True)
 
     def get_messages(self) -> List[Message]:
@@ -407,8 +472,8 @@ class Thread:
             )
 
         if isinstance(other, Agent):
-            new_thread = self.copy()
-            pending = AgentInvoke(other, new_thread, self)
+            invoke_thread = self.branch.active_view().copy()
+            pending = AgentInvoke(other, invoke_thread, self, self.branch)
             try:
                 asyncio.get_running_loop()
             except RuntimeError:
@@ -430,8 +495,8 @@ class Thread:
             return self
 
         if isinstance(other, Agent):
-            new_thread = self.copy()
-            pending = AgentInvoke(other, new_thread, self)
+            invoke_thread = self.branch.active_view().copy()
+            pending = AgentInvoke(other, invoke_thread, self, self.branch)
             try:
                 asyncio.get_running_loop()
             except RuntimeError:

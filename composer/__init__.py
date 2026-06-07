@@ -1,5 +1,6 @@
 """Composer — thread-based agents with typed streaming."""
 
+from .persistence import ChatProject, ChatSession
 from .agent import (
     Agent,
     MCPClient,
@@ -35,6 +36,7 @@ from .thread import (
 )
 from .tool_hide import (
     ToolResultHideRule,
+    HideMode,
     get_original_content,
     is_hidden_for_model,
     message_matches_rule,
@@ -59,6 +61,7 @@ __all__ = [
     "Message",
     "EncoderType",
     "TokenCalculator",
+    "HideMode",
     "ToolResultHideRule",
     "get_original_content",
     "is_hidden_for_model",
@@ -78,4 +81,6 @@ __all__ = [
     "run_tool_call",
     "extract_thinking",
     "extract_assistant_text",
+    "ChatProject",
+    "ChatSession",
 ]

@@ -71,11 +71,21 @@ class Agent:
         self.reasoning = reasoning
         self.auto_tool_call = auto_tool_call
 
-    def _prepare_messages(self, thread: Thread):
+    def _prepare_messages(
+        self,
+        thread: Thread,
+        *,
+        system_prompt_override: Optional[str] = None,
+    ):
         messages = thread.messages_for_model()
-        
+        active_prompt = (
+            system_prompt_override
+            if system_prompt_override is not None
+            else self.system_prompt
+        )
+
         if (
-            self.system_prompt
+            active_prompt
             and messages
             and isinstance(messages[0], SystemMessage)
         ):
@@ -329,13 +339,44 @@ class Agent:
         langchain_tools: List[BaseTool],
         *,
         auto_tool_call: Optional[bool] = None,
+        system_prompt: Optional[str] = None,
     ):
         run_tools = self.auto_tool_call if auto_tool_call is None else auto_tool_call
         return create_agent(
             model=self._get_model(),
             tools=langchain_tools,
-            system_prompt=self.system_prompt,
+            system_prompt=(
+                system_prompt
+                if system_prompt is not None
+                else self.system_prompt
+            ),
             interrupt_before=None if run_tools else ["tools"],
+        )
+
+    def _build_agent_for_invoke(
+        self,
+        tools: Optional[List] = None,
+        *,
+        auto_tool_call: Optional[bool] = None,
+        system_prompt_override: Optional[str] = None,
+    ):
+        return self._build_agent(
+            self._resolve_tools(tools),
+            auto_tool_call=auto_tool_call,
+            system_prompt=system_prompt_override,
+        )
+
+    async def _build_agent_for_invoke_async(
+        self,
+        tools: Optional[List] = None,
+        *,
+        auto_tool_call: Optional[bool] = None,
+        system_prompt_override: Optional[str] = None,
+    ):
+        return self._build_agent(
+            await self._resolve_tools_async(tools),
+            auto_tool_call=auto_tool_call,
+            system_prompt=system_prompt_override,
         )
 
     def _get_agent(
@@ -587,26 +628,40 @@ class Agent:
         thread: Thread,
         *,
         append_to: Optional[Thread] = None,
+        record_output: bool = True,
         tools: Optional[List] = None,
         auto_tool_call: Optional[bool] = None,
+        system_prompt_override: Optional[str] = None,
     ):
         if self._tools_need_async(tools):
             return self._sync_run_async(
                 self.ainvoke(
                     thread,
                     append_to=append_to,
+                    record_output=record_output,
                     tools=tools,
                     auto_tool_call=auto_tool_call,
+                    system_prompt_override=system_prompt_override,
                 ),
                 tools=tools,
             )
 
-        agent = self._get_agent(tools, auto_tool_call=auto_tool_call)
-        input_messages = self._prepare_messages(thread)
+        agent = self._build_agent_for_invoke(
+            tools,
+            auto_tool_call=auto_tool_call,
+            system_prompt_override=system_prompt_override,
+        )
+        input_messages = self._prepare_messages(
+            thread,
+            system_prompt_override=system_prompt_override,
+        )
 
         response = agent.invoke({"messages": input_messages})
         output_messages = response["messages"]
-        self._append_new_messages(append_to or thread, input_messages, output_messages)
+        if record_output:
+            self._append_new_messages(
+                append_to or thread, input_messages, output_messages
+            )
         return self._to_ai_message(output_messages[-1])
 
     async def ainvoke(
@@ -614,15 +669,27 @@ class Agent:
         thread: Thread,
         *,
         append_to: Optional[Thread] = None,
+        record_output: bool = True,
         tools: Optional[List] = None,
         auto_tool_call: Optional[bool] = None,
+        system_prompt_override: Optional[str] = None,
     ):
-        agent = await self._aget_agent(tools, auto_tool_call=auto_tool_call)
-        input_messages = self._prepare_messages(thread)
+        agent = await self._build_agent_for_invoke_async(
+            tools,
+            auto_tool_call=auto_tool_call,
+            system_prompt_override=system_prompt_override,
+        )
+        input_messages = self._prepare_messages(
+            thread,
+            system_prompt_override=system_prompt_override,
+        )
 
         response = await agent.ainvoke({"messages": input_messages})
         output_messages = response["messages"]
-        self._append_new_messages(append_to or thread, input_messages, output_messages)
+        if record_output:
+            self._append_new_messages(
+                append_to or thread, input_messages, output_messages
+            )
         return self._to_ai_message(output_messages[-1])
 
     def _consume_stream_chunk(

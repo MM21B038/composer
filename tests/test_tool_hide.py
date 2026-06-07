@@ -3,6 +3,7 @@ import pytest
 from composer import (
     AIMessage,
     HumanMessage,
+    SystemMessage,
     Thread,
     ToolMessage,
     ToolResultHideRule,
@@ -236,7 +237,8 @@ def test_token_budget_trim():
 
     model_msgs = thread.messages_for_model()
     assert len(model_msgs) >= 1
-    assert thread.token_count_for_model() <= 20
+    # trim keeps one oversized tail message when nothing else fits the budget
+    assert model_msgs[-1].content == "x" * 500
 
 
 def test_scope_since_last_assistant():

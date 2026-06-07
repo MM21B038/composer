@@ -17,6 +17,7 @@ HideScope = Literal[
     "same_tool_call_chain",
 ]
 HideStrategy = Literal["placeholder", "summarize", "drop"]
+HideMode = Literal["invoke_only", "persist"]
 
 OnHideMessage = Union[str, Callable[["ToolMessage", "ToolResultHideRule"], str]]
 SummarizeFn = Callable[["ToolMessage"], str]
@@ -44,12 +45,38 @@ class ToolResultHideRule:
     summarize_fn: SummarizeFn | None = None
     max_hidden_results: int | None = None
     encoder: "EncoderType" = "cl100k_base"
+    hide_mode: HideMode | None = None
 
     def __post_init__(self) -> None:
         if self.keep_latest < 0:
             raise ValueError("keep_latest must be >= 0")
         if self.min_tokens_to_hide < 0:
             raise ValueError("min_tokens_to_hide must be >= 0")
+
+
+def should_persist_rule(
+    rule: ToolResultHideRule,
+    thread_persist_tool_hides: bool,
+) -> bool:
+    if rule.hide_mode == "invoke_only":
+        return False
+    if rule.hide_mode == "persist":
+        return True
+    return thread_persist_tool_hides
+
+
+def split_hide_rules_by_mode(
+    rules: Sequence[ToolResultHideRule],
+    thread_persist_tool_hides: bool,
+) -> tuple[list[ToolResultHideRule], list[ToolResultHideRule]]:
+    invoke_rules: list[ToolResultHideRule] = []
+    persist_rules: list[ToolResultHideRule] = []
+    for rule in rules:
+        if should_persist_rule(rule, thread_persist_tool_hides):
+            persist_rules.append(rule)
+        else:
+            invoke_rules.append(rule)
+    return invoke_rules, persist_rules
 
 
 def resolve_full_tool_name(server: str | None, tool_name: str) -> str:
