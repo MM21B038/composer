@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import math
-from typing import List, Optional, Sequence, Union, overload
+from typing import Optional, Sequence, Union, overload
 
+import numpy as np
 from langchain_openai import OpenAIEmbeddings
+from numpy.typing import NDArray
 
 
 class Vector:
@@ -24,23 +25,31 @@ class Vector:
         self.dim = dim
         self.normalized = normalized
 
-        kwargs: dict = {
+        client_kwargs: dict = {
             "model": model,
             "api_key": api_key,
             "base_url": base_url,
+            # OpenAI SDK defaults to base64; many OpenAI-compatible providers
+            # (e.g. OpenRouter) only accept float embeddings.
+            "model_kwargs": {"encoding_format": "float"},
         }
         if dim is not None:
-            kwargs["dimensions"] = dim
-        self._client = OpenAIEmbeddings(**kwargs)
+            client_kwargs["dimensions"] = dim
+        if base_url is not None:
+            # Send raw text instead of tiktoken chunks for third-party endpoints.
+            client_kwargs["check_embedding_ctx_length"] = False
+        self._client = OpenAIEmbeddings(**client_kwargs)
 
-    def _postprocess(self, vec: List[float]) -> List[float]:
-        out = vec[: self.dim] if self.dim is not None else vec
+    def _postprocess(self, vec: list[float]) -> NDArray[np.float64]:
+        out = np.asarray(vec, dtype=np.float64)
+        if self.dim is not None:
+            out = out[: self.dim]
         if not self.normalized:
             return out
-        norm = math.sqrt(sum(x * x for x in out))
+        norm = np.linalg.norm(out)
         if norm == 0:
             return out
-        return [x / norm for x in out]
+        return out / norm
 
     @staticmethod
     def _validate_docs(docs: Sequence[str]) -> None:
@@ -51,14 +60,14 @@ class Vector:
                 )
 
     @overload
-    def vector(self, docs: str) -> List[float]: ...
+    def vector(self, docs: str) -> NDArray[np.float64]: ...
 
     @overload
-    def vector(self, docs: Sequence[str]) -> List[List[float]]: ...
+    def vector(self, docs: Sequence[str]) -> NDArray[np.float64]: ...
 
     def vector(
         self, docs: Union[str, Sequence[str]]
-    ) -> Union[List[float], List[List[float]]]:
+    ) -> NDArray[np.float64]:
         if isinstance(docs, str):
             return self._postprocess(self._client.embed_query(docs))
         if not isinstance(docs, (list, tuple)):
@@ -66,19 +75,21 @@ class Vector:
                 f"Expected str or sequence of str, got {type(docs).__name__}"
             )
         if len(docs) == 0:
-            return []
+            return np.empty((0, 0), dtype=np.float64)
         self._validate_docs(docs)
-        return [self._postprocess(v) for v in self._client.embed_documents(list(docs))]
+        return np.stack(
+            [self._postprocess(v) for v in self._client.embed_documents(list(docs))]
+        )
 
     @overload
-    async def avector(self, docs: str) -> List[float]: ...
+    async def avector(self, docs: str) -> NDArray[np.float64]: ...
 
     @overload
-    async def avector(self, docs: Sequence[str]) -> List[List[float]]: ...
+    async def avector(self, docs: Sequence[str]) -> NDArray[np.float64]: ...
 
     async def avector(
         self, docs: Union[str, Sequence[str]]
-    ) -> Union[List[float], List[List[float]]]:
+    ) -> NDArray[np.float64]:
         if isinstance(docs, str):
             return self._postprocess(await self._client.aembed_query(docs))
         if not isinstance(docs, (list, tuple)):
@@ -86,10 +97,10 @@ class Vector:
                 f"Expected str or sequence of str, got {type(docs).__name__}"
             )
         if len(docs) == 0:
-            return []
+            return np.empty((0, 0), dtype=np.float64)
         self._validate_docs(docs)
         raw = await self._client.aembed_documents(list(docs))
-        return [self._postprocess(v) for v in raw]
+        return np.stack([self._postprocess(v) for v in raw])
 
     def __repr__(self) -> str:
         url = "set" if self.base_url else "default"

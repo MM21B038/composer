@@ -42,6 +42,13 @@ _T = TypeVar("_T")
 _ASYNC_GEN_SENTINEL = object()
 
 
+def _in_running_loop() -> bool:
+    try:
+        return asyncio.get_running_loop().is_running()
+    except RuntimeError:
+        return False
+
+
 class Agent:
     def __init__(
         self,
@@ -65,7 +72,7 @@ class Agent:
         self.auto_tool_call = auto_tool_call
 
     def _prepare_messages(self, thread: Thread):
-        messages = thread.get_messages()
+        messages = thread.messages_for_model()
         
         if (
             self.system_prompt
@@ -180,7 +187,8 @@ class Agent:
     ) -> ToolResult:
         """Sync wrapper for arun_tool_call."""
         return self._sync_run_async(
-            self.arun_tool_call(call, tools=tools, thread=thread)
+            self.arun_tool_call(call, tools=tools, thread=thread),
+            tools=tools,
         )
 
     def _tools_need_async(self, tools: Optional[Any] = None) -> bool:
@@ -200,21 +208,49 @@ class Agent:
         except RuntimeError:
             return True
 
-    def _sync_run_async(self, coro):
-        try:
-            asyncio.get_running_loop()
-            in_running_loop = True
-        except RuntimeError:
-            in_running_loop = False
+    def _collect_mcp_clients(self, tools: Optional[Any] = None) -> List[MCPClient]:
+        raw = self.tools if tools is None else tools
+        if isinstance(raw, MCPClient):
+            return [raw]
+        if isinstance(raw, list):
+            return [item for item in raw if isinstance(item, MCPClient)]
+        return []
 
-        if not in_running_loop:
+    def _reset_loop_bound_clients(self) -> None:
+        model = self.model
+        if not isinstance(model, BaseChatModel):
+            return
+        build_client = getattr(model, "_build_client", None)
+        if build_client is not None:
+            model.client = build_client()
+
+    def _invalidate_mcp_tools(self, tools: Optional[Any] = None) -> None:
+        for mcp in self._collect_mcp_clients(tools):
+            mcp._tools = None
+
+    async def _prepare_thread_loop_context(self, tools: Optional[Any] = None) -> None:
+        self._reset_loop_bound_clients()
+        for mcp in self._collect_mcp_clients(tools):
+            mcp._tools = None
+            await mcp.load_tools(reload=True)
+
+    def _cleanup_thread_loop_context(self, tools: Optional[Any] = None) -> None:
+        self._reset_loop_bound_clients()
+        self._invalidate_mcp_tools(tools)
+
+    def _sync_run_async(self, coro, *, tools: Optional[Any] = None):
+        if not _in_running_loop():
             return asyncio.run(coro)
 
         result_queue: queue.Queue = queue.Queue(maxsize=1)
 
+        async def wrapped() -> Any:
+            await self._prepare_thread_loop_context(tools)
+            return await coro
+
         def runner() -> None:
             try:
-                result_queue.put(("ok", asyncio.run(coro)))
+                result_queue.put(("ok", asyncio.run(wrapped())))
             except Exception as exc:
                 result_queue.put(("err", exc))
 
@@ -222,17 +258,19 @@ class Agent:
         thread.start()
         kind, payload = result_queue.get()
         thread.join()
+        self._cleanup_thread_loop_context(tools)
         if kind == "err":
             raise payload
         return payload
 
     def _sync_iterate_asyncgen(
-        self, async_gen_factory: Any
+        self, async_gen_factory: Any, *, tools: Optional[Any] = None
     ) -> Iterator[_T]:
-        item_queue: queue.Queue = queue.Queue()
+        if _in_running_loop():
+            item_queue: queue.Queue = queue.Queue()
 
-        def runner() -> None:
             async def drain() -> None:
+                await self._prepare_thread_loop_context(tools)
                 try:
                     async for item in async_gen_factory():
                         item_queue.put(("ok", item))
@@ -241,23 +279,42 @@ class Agent:
                 finally:
                     item_queue.put(("done", _ASYNC_GEN_SENTINEL))
 
+            def runner() -> None:
+                try:
+                    asyncio.run(drain())
+                except Exception as exc:
+                    item_queue.put(("err", exc))
+                    item_queue.put(("done", _ASYNC_GEN_SENTINEL))
+
+            thread = threading.Thread(target=runner, daemon=True)
+            thread.start()
+            while True:
+                kind, payload = item_queue.get()
+                if kind == "done":
+                    break
+                if kind == "err":
+                    raise payload
+                yield payload
+            thread.join(timeout=1)
+            self._cleanup_thread_loop_context(tools)
+            return
+
+        item_queue: queue.Queue = queue.Queue()
+
+        async def drain() -> None:
             try:
-                asyncio.run(drain())
+                async for item in async_gen_factory():
+                    item_queue.put(("ok", item))
             except Exception as exc:
                 item_queue.put(("err", exc))
+            finally:
                 item_queue.put(("done", _ASYNC_GEN_SENTINEL))
 
         try:
-            asyncio.get_running_loop()
-            in_running_loop = True
-        except RuntimeError:
-            in_running_loop = False
-
-        if in_running_loop:
-            thread = threading.Thread(target=runner, daemon=True)
-            thread.start()
-        else:
-            runner()
+            asyncio.run(drain())
+        except Exception as exc:
+            item_queue.put(("err", exc))
+            item_queue.put(("done", _ASYNC_GEN_SENTINEL))
 
         while True:
             kind, payload = item_queue.get()
@@ -266,9 +323,6 @@ class Agent:
             if kind == "err":
                 raise payload
             yield payload
-
-        if in_running_loop:
-            thread.join(timeout=1)
 
     def _build_agent(
         self,
@@ -543,7 +597,8 @@ class Agent:
                     append_to=append_to,
                     tools=tools,
                     auto_tool_call=auto_tool_call,
-                )
+                ),
+                tools=tools,
             )
 
         agent = self._get_agent(tools, auto_tool_call=auto_tool_call)
@@ -654,7 +709,8 @@ class Agent:
                     append_to=append_to,
                     tools=tools,
                     auto_tool_call=auto_tool_call,
-                )
+                ),
+                tools=tools,
             )
             return
 
@@ -718,7 +774,8 @@ class Agent:
                     append_to=append_to,
                     tools=tools,
                     auto_tool_call=auto_tool_call,
-                )
+                ),
+                tools=tools,
             )
             return
 

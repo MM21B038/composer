@@ -1,4 +1,4 @@
-from typing import List, Union, Optional, TYPE_CHECKING, get_args, Literal
+from typing import List, Union, Optional, TYPE_CHECKING, get_args, Literal, ClassVar
 import asyncio
 import json
 
@@ -12,12 +12,61 @@ from langchain_core.messages import (
     ToolMessage as BaseToolMessage,
 )
 
+from .image import (
+    ImageAttach,
+    ImageSource,
+    build_image_block,
+    merge_image_content,
+    resolve_config,
+)
+from .tool_hide import (
+    ToolResultHideRule,
+    apply_rolling_message_window,
+    apply_tool_hide_rules_to_messages,
+    get_original_content,
+    is_hidden_for_model,
+    persist_tool_hide_rules,
+    restore_hidden_tool_messages,
+    trim_messages_to_token_budget,
+)
+
 if TYPE_CHECKING:
     from .agent import Agent
 
 
+class _AttachDescriptor:
+    """Supports HumanMessage.attach(...) and HumanMessage(...).attach(...)."""
+
+    def __get__(self, obj: Optional["HumanMessage"], owner: type["HumanMessage"]):
+        def bound(
+            source: ImageSource,
+            config: ImageAttach | None = None,
+            **kwargs: object,
+        ) -> "HumanMessage":
+            cfg = resolve_config(config, **kwargs)
+            image_block = build_image_block(source, cfg)
+            if obj is None:
+                return owner(content=[image_block])
+            return owner(content=merge_image_content(obj.content, image_block))
+
+        return bound
+
+
 class HumanMessage(BaseHumanMessage):
-    pass
+    attach: ClassVar[_AttachDescriptor] = _AttachDescriptor()
+
+
+class ImageMessage(HumanMessage):
+    """Human message containing a single image block (no text)."""
+
+    def __init__(
+        self,
+        source: ImageSource,
+        config: ImageAttach | None = None,
+        **kwargs: object,
+    ) -> None:
+        cfg = resolve_config(config, **kwargs)
+        super().__init__(content=[build_image_block(source, cfg)])
 
 
 class AIMessage(BaseAIMessage):
@@ -34,17 +83,14 @@ class ToolMessage(BaseToolMessage):
 class CompressedMessage(BaseHumanMessage):
     pass
 
-class UpdateMessage(BaseHumanMessage):
-    pass
-
 
 Message = Union[
     HumanMessage,
+    ImageMessage,
     AIMessage,
     SystemMessage,
     ToolMessage,
     CompressedMessage,
-    UpdateMessage,
 ]
 
 EncoderType = Literal[
@@ -169,19 +215,96 @@ class Thread:
         auto_append_ai_message: bool = True,
         auto_append_tool_calls: bool = True,
         auto_append_tool_results: bool = True,
+        tool_hide_rules: Optional[List[ToolResultHideRule]] = None,
+        persist_tool_hides: bool = False,
+        max_messages_for_model: Optional[int] = None,
+        max_tokens_for_model: Optional[int] = None,
+        model_view_encoder: EncoderType = "cl100k_base",
     ):
         self.thread = thread or []
         self.auto_append_ai_message = auto_append_ai_message
         self.auto_append_tool_calls = auto_append_tool_calls
         self.auto_append_tool_results = auto_append_tool_results
+        self.tool_hide_rules: List[ToolResultHideRule] = list(tool_hide_rules or [])
+        self.persist_tool_hides = persist_tool_hides
+        self.max_messages_for_model = max_messages_for_model
+        self.max_tokens_for_model = max_tokens_for_model
+        self.model_view_encoder = model_view_encoder
+
+    def _thread_kwargs(self) -> dict:
+        return {
+            "auto_append_ai_message": self.auto_append_ai_message,
+            "auto_append_tool_calls": self.auto_append_tool_calls,
+            "auto_append_tool_results": self.auto_append_tool_results,
+            "tool_hide_rules": list(self.tool_hide_rules),
+            "persist_tool_hides": self.persist_tool_hides,
+            "max_messages_for_model": self.max_messages_for_model,
+            "max_tokens_for_model": self.max_tokens_for_model,
+            "model_view_encoder": self.model_view_encoder,
+        }
 
     def copy(self):
-        return Thread(
-            self.thread.copy(),
-            auto_append_ai_message=self.auto_append_ai_message,
-            auto_append_tool_calls=self.auto_append_tool_calls,
-            auto_append_tool_results=self.auto_append_tool_results,
+        return Thread(self.thread.copy(), **self._thread_kwargs())
+
+    def add_tool_hide_rule(self, rule: ToolResultHideRule) -> None:
+        self.tool_hide_rules.append(rule)
+        if self.persist_tool_hides:
+            self.apply_tool_hide_rules(retroactive=True)
+
+    def remove_tool_hide_rule(
+        self,
+        *,
+        tool_name: str,
+        server: Optional[str] = None,
+    ) -> bool:
+        before = len(self.tool_hide_rules)
+        self.tool_hide_rules = [
+            rule
+            for rule in self.tool_hide_rules
+            if not (rule.tool_name == tool_name and rule.server == server)
+        ]
+        return len(self.tool_hide_rules) < before
+
+    def apply_tool_hide_rules(self, *, retroactive: bool = True) -> None:
+        if not retroactive or not self.tool_hide_rules:
+            return
+        if self.persist_tool_hides:
+            persist_tool_hide_rules(self.thread, self.tool_hide_rules)
+
+    def messages_for_model(
+        self,
+        *,
+        max_tokens: Optional[int] = None,
+        max_messages: Optional[int] = None,
+        encoder: Optional[EncoderType] = None,
+    ) -> List[Message]:
+        """Collapsed view of thread messages for LLM context."""
+        enc = encoder or self.model_view_encoder
+        messages = apply_tool_hide_rules_to_messages(
+            self.thread,
+            self.tool_hide_rules,
+            persist=False,
         )
+
+        window = (
+            max_messages
+            if max_messages is not None
+            else self.max_messages_for_model
+        )
+        if window is not None:
+            messages = apply_rolling_message_window(messages, window)
+
+        budget = max_tokens if max_tokens is not None else self.max_tokens_for_model
+        if budget is not None:
+            messages = trim_messages_to_token_budget(messages, budget, enc)
+
+        return messages
+
+    def get_original_tool_content(self, message: ToolMessage) -> str:
+        return get_original_content(message)
+
+    def is_tool_hidden_for_model(self, message: ToolMessage) -> bool:
+        return is_hidden_for_model(message)
 
     def appends_agent_messages(self) -> bool:
         return (
@@ -205,17 +328,10 @@ class Thread:
         ):
             self.thread.insert(0, message)
 
-        elif (
-            isinstance(message, UpdateMessage)
-        ):
-            for i in range(len(self.thread) - 1, -1, -1):
-                if isinstance(self.thread[i], UpdateMessage):
-                    self.thread.pop(i)
-                    break
-            self.thread.append(message)
-
         else:
             self.thread.append(message)
+            if isinstance(message, ToolMessage) and self.persist_tool_hides:
+                self.apply_tool_hide_rules(retroactive=True)
 
     def get_messages(self) -> List[Message]:
         return self.thread
@@ -235,11 +351,24 @@ class Thread:
     def pop(self, index):
         return self.thread.pop(index)
 
+    def restore_hidden_tool_messages(self) -> int:
+        return restore_hidden_tool_messages(self.thread)
+
     def token_count(
         self,
         encoder: EncoderType = "cl100k_base",
     ) -> int:
         return TokenCalculator.count_messages(self, encoder)
+
+    def token_count_for_model(
+        self,
+        encoder: Optional[EncoderType] = None,
+    ) -> int:
+        enc = encoder or self.model_view_encoder
+        return TokenCalculator.count_messages(
+            self.messages_for_model(encoder=enc),
+            enc,
+        )
 
     def token_counts(
         self,
@@ -326,12 +455,7 @@ class Thread:
 
     def __getitem__(self, index):
         if isinstance(index, slice):
-            return Thread(
-                self.thread[index],
-                auto_append_ai_message=self.auto_append_ai_message,
-                auto_append_tool_calls=self.auto_append_tool_calls,
-                auto_append_tool_results=self.auto_append_tool_results,
-            )
+            return Thread(self.thread[index], **self._thread_kwargs())
         return self.thread[index]
 
     def __len__(self):

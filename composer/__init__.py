@@ -20,17 +20,26 @@ from .agent import (
 )
 from .tools import run_tool_call
 from .vector import Vector
+from .image import ImageAttach
 from .thread import (
     Thread,
     HumanMessage,
+    ImageMessage,
     AIMessage,
     SystemMessage,
     ToolMessage,
     CompressedMessage,
-    UpdateMessage,
     Message,
     EncoderType,
     TokenCalculator,
+)
+from .tool_hide import (
+    ToolResultHideRule,
+    get_original_content,
+    is_hidden_for_model,
+    message_matches_rule,
+    resolve_full_tool_name,
+    restore_hidden_tool_messages,
 )
 
 __all__ = [
@@ -41,14 +50,21 @@ __all__ = [
     "MCPResourceInfo",
     "Thread",
     "HumanMessage",
+    "ImageMessage",
+    "ImageAttach",
     "AIMessage",
     "SystemMessage",
     "ToolMessage",
     "CompressedMessage",
-    "UpdateMessage",
     "Message",
     "EncoderType",
     "TokenCalculator",
+    "ToolResultHideRule",
+    "get_original_content",
+    "is_hidden_for_model",
+    "message_matches_rule",
+    "resolve_full_tool_name",
+    "restore_hidden_tool_messages",
     "ThinkingEvent",
     "AssistantEvent",
     "ToolCallEvent",

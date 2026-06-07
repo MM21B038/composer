@@ -29,9 +29,6 @@ class ToolMessage(BaseToolMessage):
 class CompressedMessage(BaseHumanMessage):
     pass
 
-class UpdateMessage(BaseHumanMessage):
-    pass
-
 
 Message = Union[
     HumanMessage,
@@ -39,7 +36,6 @@ Message = Union[
     SystemMessage,
     ToolMessage,
     CompressedMessage,
-    UpdateMessage,
 ]
 
 
@@ -70,14 +66,6 @@ class Thread:
         ):
             self.thread.insert(0, message)
 
-        elif (
-            isinstance(message, UpdateMessage)
-        ):
-            for i in range(len(self.thread) - 1, -1, -1):
-                if isinstance(self.thread[i], UpdateMessage):
-                    self.thread.pop(i)
-                    break
-            self.thread.append(message)
 
         else:
             self.thread.append(message)

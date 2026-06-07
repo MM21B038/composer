@@ -23,7 +23,6 @@ from .thread import (
     SystemMessage,
     ToolMessage,
     CompressedMessage,
-    UpdateMessage,
     Message,
 )
 
@@ -36,7 +35,6 @@ __all__ = [
     "SystemMessage",
     "ToolMessage",
     "CompressedMessage",
-    "UpdateMessage",
     "Message",
     "ThinkingEvent",
     "AssistantEvent",

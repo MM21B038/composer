@@ -149,7 +149,6 @@ class StreamEventProcessor:
 
         meta = metadata or {}
         events: List[StreamEvent] = []
-        events.extend(self._reasoning_details_events(message, meta))
 
         if isinstance(message, AIMessageChunk):
             self._ai_accum = (
@@ -203,7 +202,7 @@ class StreamEventProcessor:
     def _thinking_delta_events(
         self, message: Any, metadata: Dict[str, Any]
     ) -> List[StreamEvent]:
-        full = _extract_thinking_without_details(message)
+        full = _extract_streaming_thinking(message)
         if len(full) <= self._thinking_len:
             return []
         delta = full[self._thinking_len :]
@@ -222,24 +221,6 @@ class StreamEventProcessor:
 
     def _thinking_from_complete_message(self, message: Any) -> List[StreamEvent]:
         return self._thinking_delta_events(message, {})
-
-    def _reasoning_details_events(
-        self, message: Any, metadata: Dict[str, Any]
-    ) -> List[StreamEvent]:
-        parts: List[str] = []
-        for detail in _iter_reasoning_details(message):
-            text = _reasoning_detail_text(detail)
-            if text:
-                parts.append(text)
-        if not parts:
-            return []
-        return [
-            ThinkingEvent(
-                text="".join(parts),
-                message=message,
-                metadata={**metadata, "source": "reasoning_details"},
-            )
-        ]
 
     def _tool_call_events_from_message(
         self,
@@ -264,12 +245,24 @@ class StreamEventProcessor:
 
 
 def extract_thinking(message: Any) -> str:
-    parts: List[str] = [_extract_thinking_without_details(message)]
-    for detail in _iter_reasoning_details(message):
-        part = _reasoning_detail_text(detail)
-        if part:
-            parts.append(part)
-    return "".join(p for p in parts if p)
+    return _extract_streaming_thinking(message)
+
+
+def _extract_streaming_thinking(message: Any) -> str:
+    """Single canonical thinking text for streaming deltas and invoke."""
+    from_blocks = _extract_thinking_without_details(message)
+    if from_blocks:
+        return from_blocks
+    return _extract_reasoning_details_text(message)
+
+
+def _extract_reasoning_details_text(message: Any) -> str:
+    parts = [
+        part
+        for detail in _iter_reasoning_details(message)
+        if (part := _reasoning_detail_text(detail))
+    ]
+    return _join_thinking_parts(parts)
 
 
 def extract_assistant_text(message: Any) -> str:
@@ -302,6 +295,15 @@ def parse_langgraph_chunk(chunk: Any) -> Optional[tuple[str, Any]]:
     return None
 
 
+def _join_thinking_parts(parts: List[str]) -> str:
+    cleaned = [p for p in parts if p]
+    if not cleaned:
+        return ""
+    if len(cleaned) > 1 and cleaned[-1].startswith(cleaned[0]):
+        return cleaned[-1]
+    return "".join(cleaned)
+
+
 def _extract_thinking_without_details(message: Any) -> str:
     parts: List[str] = []
 
@@ -313,11 +315,14 @@ def _extract_thinking_without_details(message: Any) -> str:
             else str(reasoning_field)
         )
 
+    block_parts: List[str] = []
     for block in _iter_content_blocks(message):
         if _block_type(block) == "reasoning":
             part = _block_text(block, keys=("reasoning", "text", "content"))
             if part:
-                parts.append(part)
+                block_parts.append(part)
+    if block_parts:
+        parts.append(_join_thinking_parts(block_parts))
 
     kwargs = getattr(message, "additional_kwargs", None) or {}
     reasoning = (
@@ -331,7 +336,7 @@ def _extract_thinking_without_details(message: Any) -> str:
         elif isinstance(reasoning, dict):
             parts.append(reasoning.get("text") or reasoning.get("content") or "")
 
-    return "".join(parts)
+    return _join_thinking_parts(parts)
 
 
 def _iter_content_blocks(message: Any) -> List[Any]:
