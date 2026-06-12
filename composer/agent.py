@@ -2,6 +2,8 @@ import asyncio
 import inspect
 import queue
 import threading
+import warnings
+from contextlib import contextmanager
 from typing import Literal, List, Optional, Union, AsyncIterator, Iterator, Sequence, Any, Tuple, Dict, TypeVar
 
 from langchain.agents import create_agent
@@ -21,9 +23,16 @@ from .stream import (
     ToolResultEvent,
     extract_assistant_text,
     extract_thinking,
+    message_model_dump,
+    normalize_ai_message_dump,
     normalize_response_metadata,
     parse_langgraph_chunk,
+    parse_custom_model_chunk,
+    compact_ai_message_dump,
+    is_stub_stream_text,
+    sanitize_chunk_for_merge,
 )
+from .streaming_middleware import StreamingModelMiddleware
 from .thread import (
     SystemMessage,
     AIMessage,
@@ -47,6 +56,18 @@ def _in_running_loop() -> bool:
         return asyncio.get_running_loop().is_running()
     except RuntimeError:
         return False
+
+
+@contextmanager
+def _suppress_openai_response_serializer_warnings():
+    """LangChain's Responses API parser calls Response.model_dump() without warnings=False."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Pydantic serializer warnings:",
+            category=UserWarning,
+        )
+        yield
 
 
 class Agent:
@@ -345,6 +366,7 @@ class Agent:
         return create_agent(
             model=self._get_model(),
             tools=langchain_tools,
+            middleware=[StreamingModelMiddleware()],
             system_prompt=(
                 system_prompt
                 if system_prompt is not None
@@ -403,22 +425,72 @@ class Agent:
 
 
     def _to_ai_message(self, message) -> AIMessage:
-        if isinstance(message, AIMessage) and not isinstance(message, AIMessageChunk):
-            if message.response_metadata:
-                normalized = normalize_response_metadata(message.response_metadata)
-                if normalized != message.response_metadata:
-                    dump = message.model_dump()
-                    dump["response_metadata"] = normalized
-                    return AIMessage.model_validate(dump)
-            return message
-        dump = message.model_dump()
+        dump = message_model_dump(message)
         if dump.get("type") == "AIMessageChunk":
             dump["type"] = "ai"
-        if dump.get("response_metadata"):
-            dump["response_metadata"] = normalize_response_metadata(
-                dump["response_metadata"]
-            )
+        dump = normalize_ai_message_dump(message, dump)
         return AIMessage.model_validate(dump)
+
+    def _enrich_ai_message_from_stream(
+        self,
+        message: Any,
+        *,
+        streamed_thinking: str = "",
+        streamed_assistant: str = "",
+    ) -> AIMessage:
+        ai_message = self._to_ai_message(message)
+        if not streamed_thinking and not streamed_assistant:
+            return ai_message
+
+        dump = message_model_dump(ai_message)
+        kwargs = dict(dump.get("additional_kwargs") or {})
+        existing_thinking = kwargs.get("reasoning_content", "")
+        if streamed_thinking and (
+            not existing_thinking or is_stub_stream_text(str(existing_thinking))
+        ):
+            kwargs["reasoning_content"] = streamed_thinking
+        content = dump.get("content", "")
+        if streamed_assistant and not (
+            isinstance(content, str) and content.strip()
+        ):
+            dump["content"] = streamed_assistant
+        dump["additional_kwargs"] = kwargs
+        interim = AIMessage.model_validate({**dump, "type": "ai"})
+        dump = normalize_ai_message_dump(interim, dump)
+        dump = compact_ai_message_dump(dump)
+        return AIMessage.model_validate(dump)
+
+    def _append_stream_values_messages(
+        self,
+        thread: Thread,
+        append_to: Optional[Thread],
+        output_messages: Sequence[Any],
+        start_index: int,
+        *,
+        streamed_thinking: str = "",
+        streamed_assistant: str = "",
+    ) -> None:
+        target = append_to or thread
+        if not target.appends_agent_messages():
+            return
+        pending_thinking = streamed_thinking
+        pending_assistant = streamed_assistant
+        for message in output_messages[start_index:]:
+            if getattr(message, "type", None) == "ai" and (
+                pending_thinking or pending_assistant
+            ):
+                message = self._enrich_ai_message_from_stream(
+                    message,
+                    streamed_thinking=pending_thinking,
+                    streamed_assistant=pending_assistant,
+                )
+                pending_thinking = ""
+                pending_assistant = ""
+            if self._should_append_message(target, message):
+                if getattr(message, "type", None) == "ai":
+                    target.append(message)
+                else:
+                    target.append(self._to_thread_message(message))
 
     def _to_thread_message(self, message) -> Union[HumanMessage, AIMessage, SystemMessage, ToolMessage]:
         if isinstance(message, (HumanMessage, AIMessage, SystemMessage, ToolMessage)):
@@ -432,7 +504,7 @@ class Agent:
         if msg_type == "ai":
             return self._to_ai_message(message)
 
-        dump = message.model_dump()
+        dump = message_model_dump(message)
         if msg_type == "ai" and dump.get("type") in ("AIMessageChunk",):
             dump["type"] = "ai"
 
@@ -445,6 +517,8 @@ class Agent:
         cls = type_map.get(msg_type)
         if cls is None:
             raise ValueError(f"Unsupported message type: {msg_type!r}")
+        if cls is AIMessage:
+            return self._to_ai_message(message)
         return cls.model_validate(dump)
 
     def _should_append_message(self, thread: Thread, message: Any) -> bool:
@@ -457,6 +531,22 @@ class Agent:
             return thread.auto_append_ai_message
         return True
 
+    def _new_messages_to_append(
+        self,
+        thread: Thread,
+        input_messages: Sequence[Any],
+        output_messages: Sequence[Any],
+    ) -> List[Any]:
+        existing_count = len(thread.get_messages())
+        new_messages = list(output_messages[existing_count:])
+        if not new_messages:
+            new_messages = list(output_messages[len(input_messages) :])
+        if not new_messages and output_messages:
+            last = output_messages[-1]
+            if getattr(last, "type", None) in ("ai", "AIMessage", "AIMessageChunk"):
+                new_messages = [last]
+        return new_messages
+
     def _append_new_messages(
         self,
         thread: Thread,
@@ -465,7 +555,9 @@ class Agent:
     ) -> None:
         if not thread.appends_agent_messages():
             return
-        for message in output_messages[len(input_messages) :]:
+        for message in self._new_messages_to_append(
+            thread, input_messages, output_messages
+        ):
             if self._should_append_message(thread, message):
                 thread.append(self._to_thread_message(message))
 
@@ -479,21 +571,40 @@ class Agent:
         if metadata_source is None:
             return ai_message
 
-        dump = ai_message.model_dump()
+        dump = message_model_dump(ai_message)
         if metadata_source.response_metadata:
             dump["response_metadata"] = normalize_response_metadata(
-                metadata_source.response_metadata
+                {
+                    **dump.get("response_metadata", {}),
+                    **metadata_source.response_metadata,
+                }
             )
         if metadata_source.usage_metadata:
             dump["usage_metadata"] = metadata_source.usage_metadata
-        if metadata_source.additional_kwargs:
-            dump["additional_kwargs"] = {
-                **dump.get("additional_kwargs", {}),
-                **metadata_source.additional_kwargs,
-            }
         if metadata_source.id:
             dump["id"] = metadata_source.id
+        merged = AIMessage.model_validate({**dump, "type": "ai"})
+        dump = normalize_ai_message_dump(merged, dump)
+        dump = compact_ai_message_dump(dump)
         return AIMessage.model_validate(dump)
+
+    def _accumulate_ai_chunk(
+        self,
+        message: AIMessageChunk,
+        accumulated: Optional[AIMessageChunk],
+        last_stream_chunk: Optional[AIMessageChunk],
+        last_finish_chunk: Optional[AIMessageChunk],
+    ) -> Tuple[
+        Optional[AIMessageChunk],
+        Optional[AIMessageChunk],
+        Optional[AIMessageChunk],
+    ]:
+        message = sanitize_chunk_for_merge(message)
+        last_stream_chunk = message
+        if message.response_metadata.get("finish_reason"):
+            last_finish_chunk = message
+        accumulated = message if accumulated is None else accumulated + message
+        return accumulated, last_stream_chunk, last_finish_chunk
 
     def _process_stream_chunk(
         self,
@@ -521,14 +632,21 @@ class Agent:
         if mode == "messages":
             message = data[0] if isinstance(data, tuple) and len(data) == 2 else data
             if isinstance(message, AIMessageChunk):
-                last_stream_chunk = message
-                if message.response_metadata.get("finish_reason"):
-                    last_finish_chunk = message
-                accumulated = (
-                    message if accumulated is None else accumulated + message
-                )
+                pass
             elif getattr(message, "type", None) in ("ai", "AIMessageChunk"):
                 last_ai_message = message
+
+        elif mode == "custom":
+            message = parse_custom_model_chunk(data)
+            if isinstance(message, AIMessageChunk):
+                accumulated, last_stream_chunk, last_finish_chunk = (
+                    self._accumulate_ai_chunk(
+                        message,
+                        accumulated,
+                        last_stream_chunk,
+                        last_finish_chunk,
+                    )
+                )
 
         elif mode == "values" and isinstance(data, dict):
             messages = data.get("messages", [])
@@ -555,7 +673,7 @@ class Agent:
         return stream_mode, False
 
     def _events_stream_modes(self) -> List[str]:
-        return ["messages", "values"]
+        return ["messages", "values", "custom"]
 
     def _yield_stream_chunk(self, chunk: Any, filter_messages_only: bool) -> Optional[Any]:
         if not filter_messages_only:
@@ -576,10 +694,33 @@ class Agent:
         last_ai_message: Any,
         last_stream_chunk: Optional[AIMessageChunk],
         last_finish_chunk: Optional[AIMessageChunk],
+        *,
+        output_messages_start_index: Optional[int] = None,
+        streamed_thinking: str = "",
+        streamed_assistant: str = "",
     ) -> None:
         target = append_to or thread
         if last_output_messages is not None:
-            self._append_new_messages(target, input_messages, last_output_messages)
+            if output_messages_start_index is not None:
+                pending_thinking = streamed_thinking
+                pending_assistant = streamed_assistant
+                for message in last_output_messages[output_messages_start_index:]:
+                    if getattr(message, "type", None) == "ai" and (
+                        pending_thinking or pending_assistant
+                    ):
+                        message = self._enrich_ai_message_from_stream(
+                            message,
+                            streamed_thinking=pending_thinking,
+                            streamed_assistant=pending_assistant,
+                        )
+                        pending_thinking = ""
+                        pending_assistant = ""
+                    if self._should_append_message(target, message):
+                        target.append(self._to_thread_message(message))
+            else:
+                self._append_new_messages(
+                    target, input_messages, last_output_messages
+                )
             return
 
         ai_message = self._resolve_stream_result(
@@ -656,7 +797,8 @@ class Agent:
             system_prompt_override=system_prompt_override,
         )
 
-        response = agent.invoke({"messages": input_messages})
+        with _suppress_openai_response_serializer_warnings():
+            response = agent.invoke({"messages": input_messages})
         output_messages = response["messages"]
         if record_output:
             self._append_new_messages(
@@ -684,7 +826,8 @@ class Agent:
             system_prompt_override=system_prompt_override,
         )
 
-        response = await agent.ainvoke({"messages": input_messages})
+        with _suppress_openai_response_serializer_warnings():
+            response = await agent.ainvoke({"messages": input_messages})
         output_messages = response["messages"]
         if record_output:
             self._append_new_messages(
@@ -733,10 +876,18 @@ class Agent:
             last_output_messages,
         )
 
+    def _reset_turn_stream_state(
+        self,
+    ) -> tuple[None, None, None]:
+        return None, None, None
+
     def _yield_events_from_chunk(
         self,
         chunk: Any,
         processor: StreamEventProcessor,
+        *,
+        accumulated: Optional[AIMessageChunk] = None,
+        last_stream_chunk: Optional[AIMessageChunk] = None,
     ) -> Iterator[StreamEvent]:
         parsed = parse_langgraph_chunk(chunk)
         if parsed is None:
@@ -746,9 +897,36 @@ class Agent:
         if mode == "messages":
             message = data[0] if isinstance(data, tuple) and len(data) == 2 else data
             metadata = data[1] if isinstance(data, tuple) and len(data) == 2 else {}
+            if isinstance(message, AIMessageChunk):
+                return
             yield from processor.process_message_chunk(message, metadata)
+        elif mode == "custom":
+            message = parse_custom_model_chunk(data)
+            if message is not None:
+                yield from processor.process_message_chunk(message, {})
         elif mode == "values" and isinstance(data, dict):
+            turn_source = accumulated or last_stream_chunk
+            if turn_source is not None:
+                processor.merge_turn_accumulation(turn_source)
             yield from processor.process_values_update(data)
+
+    def _yield_flush_events(
+        self,
+        processor: StreamEventProcessor,
+        *,
+        accumulated: Optional[AIMessageChunk],
+        last_ai_message: Any,
+        last_stream_chunk: Optional[AIMessageChunk],
+        last_finish_chunk: Optional[AIMessageChunk],
+    ) -> Iterator[StreamEvent]:
+        final_message = self._resolve_stream_result(
+            accumulated,
+            last_ai_message,
+            last_stream_chunk,
+            last_finish_chunk,
+        )
+        if final_message is not None:
+            yield from processor.flush(final_message)
 
     def stream(
         self,
@@ -791,28 +969,29 @@ class Agent:
         last_output_messages: Optional[List[Any]] = None
 
         try:
-            for chunk in agent.stream(
-                {"messages": input_messages},
-                stream_mode=internal_mode,
-            ):
-                (
-                    accumulated,
-                    last_ai_message,
-                    last_stream_chunk,
-                    last_finish_chunk,
-                    last_output_messages,
-                ) = self._consume_stream_chunk(
-                    chunk,
-                    internal_mode,
-                    accumulated=accumulated,
-                    last_ai_message=last_ai_message,
-                    last_stream_chunk=last_stream_chunk,
-                    last_finish_chunk=last_finish_chunk,
-                    last_output_messages=last_output_messages,
-                )
-                out = self._yield_stream_chunk(chunk, filter_messages_only)
-                if out is not None:
-                    yield out
+            with _suppress_openai_response_serializer_warnings():
+                for chunk in agent.stream(
+                    {"messages": input_messages},
+                    stream_mode=internal_mode,
+                ):
+                    (
+                        accumulated,
+                        last_ai_message,
+                        last_stream_chunk,
+                        last_finish_chunk,
+                        last_output_messages,
+                    ) = self._consume_stream_chunk(
+                        chunk,
+                        internal_mode,
+                        accumulated=accumulated,
+                        last_ai_message=last_ai_message,
+                        last_stream_chunk=last_stream_chunk,
+                        last_finish_chunk=last_finish_chunk,
+                        last_output_messages=last_output_messages,
+                    )
+                    out = self._yield_stream_chunk(chunk, filter_messages_only)
+                    if out is not None:
+                        yield out
         finally:
             self._finalize_stream_append(
                 thread,
@@ -855,38 +1034,97 @@ class Agent:
         last_finish_chunk: Optional[AIMessageChunk] = None
         last_output_messages: Optional[List[Any]] = None
         processor = StreamEventProcessor(input_message_count=len(input_messages))
+        stream_output_count = len(input_messages)
+        flush_accumulated: Optional[AIMessageChunk] = None
+        flush_stream_chunk: Optional[AIMessageChunk] = None
+        flush_finish_chunk: Optional[AIMessageChunk] = None
+        last_stream_snapshots: tuple[str, str] = ("", "")
 
         try:
-            for chunk in agent.stream(
-                {"messages": input_messages},
-                stream_mode=internal_mode,
-            ):
-                (
-                    accumulated,
-                    last_ai_message,
-                    last_stream_chunk,
-                    last_finish_chunk,
-                    last_output_messages,
-                ) = self._consume_stream_chunk(
-                    chunk,
-                    internal_mode,
-                    accumulated=accumulated,
-                    last_ai_message=last_ai_message,
-                    last_stream_chunk=last_stream_chunk,
-                    last_finish_chunk=last_finish_chunk,
-                    last_output_messages=last_output_messages,
-                )
-                yield from self._yield_events_from_chunk(chunk, processor)
+            with _suppress_openai_response_serializer_warnings():
+                for chunk in agent.stream(
+                    {"messages": input_messages},
+                    stream_mode=internal_mode,
+                ):
+                    (
+                        accumulated,
+                        last_ai_message,
+                        last_stream_chunk,
+                        last_finish_chunk,
+                        last_output_messages,
+                    ) = self._consume_stream_chunk(
+                        chunk,
+                        internal_mode,
+                        accumulated=accumulated,
+                        last_ai_message=last_ai_message,
+                        last_stream_chunk=last_stream_chunk,
+                        last_finish_chunk=last_finish_chunk,
+                        last_output_messages=last_output_messages,
+                    )
+                    parsed = parse_langgraph_chunk(chunk)
+                    stream_snapshots = None
+                    if (
+                        parsed
+                        and parsed[0] == "values"
+                        and isinstance(parsed[1], dict)
+                    ):
+                        stream_snapshots = processor.peek_turn_snapshots()
+                    yield from self._yield_events_from_chunk(
+                        chunk,
+                        processor,
+                        accumulated=accumulated,
+                        last_stream_chunk=last_stream_chunk,
+                    )
+                    if parsed and parsed[0] == "values":
+                        values_messages = (
+                            parsed[1].get("messages", [])
+                            if isinstance(parsed[1], dict)
+                            else []
+                        )
+                        if (
+                            values_messages
+                            and len(values_messages) > stream_output_count
+                            and stream_snapshots is not None
+                        ):
+                            streamed_thinking, streamed_assistant = stream_snapshots
+                            self._append_stream_values_messages(
+                                thread,
+                                append_to,
+                                values_messages,
+                                stream_output_count,
+                                streamed_thinking=streamed_thinking,
+                                streamed_assistant=streamed_assistant,
+                            )
+                            stream_output_count = len(values_messages)
+                        flush_accumulated = accumulated
+                        flush_stream_chunk = last_stream_chunk
+                        flush_finish_chunk = last_finish_chunk
+                        if stream_snapshots is not None:
+                            last_stream_snapshots = stream_snapshots
+                        accumulated, last_stream_chunk, last_finish_chunk = (
+                            self._reset_turn_stream_state()
+                        )
+            yield from self._yield_flush_events(
+                processor,
+                accumulated=flush_accumulated,
+                last_ai_message=last_ai_message,
+                last_stream_chunk=flush_stream_chunk,
+                last_finish_chunk=flush_finish_chunk,
+            )
         finally:
+            streamed_thinking, streamed_assistant = last_stream_snapshots
             self._finalize_stream_append(
                 thread,
                 append_to,
                 input_messages,
                 last_output_messages,
-                accumulated,
+                flush_accumulated,
                 last_ai_message,
-                last_stream_chunk,
-                last_finish_chunk,
+                flush_stream_chunk,
+                flush_finish_chunk,
+                output_messages_start_index=stream_output_count,
+                streamed_thinking=streamed_thinking,
+                streamed_assistant=streamed_assistant,
             )
 
     async def astream(
@@ -918,28 +1156,29 @@ class Agent:
         last_output_messages: Optional[List[Any]] = None
 
         try:
-            async for chunk in agent.astream(
-                {"messages": input_messages},
-                stream_mode=internal_mode,
-            ):
-                (
-                    accumulated,
-                    last_ai_message,
-                    last_stream_chunk,
-                    last_finish_chunk,
-                    last_output_messages,
-                ) = self._consume_stream_chunk(
-                    chunk,
-                    internal_mode,
-                    accumulated=accumulated,
-                    last_ai_message=last_ai_message,
-                    last_stream_chunk=last_stream_chunk,
-                    last_finish_chunk=last_finish_chunk,
-                    last_output_messages=last_output_messages,
-                )
-                out = self._yield_stream_chunk(chunk, filter_messages_only)
-                if out is not None:
-                    yield out
+            with _suppress_openai_response_serializer_warnings():
+                async for chunk in agent.astream(
+                    {"messages": input_messages},
+                    stream_mode=internal_mode,
+                ):
+                    (
+                        accumulated,
+                        last_ai_message,
+                        last_stream_chunk,
+                        last_finish_chunk,
+                        last_output_messages,
+                    ) = self._consume_stream_chunk(
+                        chunk,
+                        internal_mode,
+                        accumulated=accumulated,
+                        last_ai_message=last_ai_message,
+                        last_stream_chunk=last_stream_chunk,
+                        last_finish_chunk=last_finish_chunk,
+                        last_output_messages=last_output_messages,
+                    )
+                    out = self._yield_stream_chunk(chunk, filter_messages_only)
+                    if out is not None:
+                        yield out
         finally:
             self._finalize_stream_append(
                 thread,
@@ -970,39 +1209,99 @@ class Agent:
         last_finish_chunk: Optional[AIMessageChunk] = None
         last_output_messages: Optional[List[Any]] = None
         processor = StreamEventProcessor(input_message_count=len(input_messages))
+        stream_output_count = len(input_messages)
+        flush_accumulated: Optional[AIMessageChunk] = None
+        flush_stream_chunk: Optional[AIMessageChunk] = None
+        flush_finish_chunk: Optional[AIMessageChunk] = None
+        last_stream_snapshots: tuple[str, str] = ("", "")
 
         try:
-            async for chunk in agent.astream(
-                {"messages": input_messages},
-                stream_mode=internal_mode,
+            with _suppress_openai_response_serializer_warnings():
+                async for chunk in agent.astream(
+                    {"messages": input_messages},
+                    stream_mode=internal_mode,
+                ):
+                    (
+                        accumulated,
+                        last_ai_message,
+                        last_stream_chunk,
+                        last_finish_chunk,
+                        last_output_messages,
+                    ) = self._consume_stream_chunk(
+                        chunk,
+                        internal_mode,
+                        accumulated=accumulated,
+                        last_ai_message=last_ai_message,
+                        last_stream_chunk=last_stream_chunk,
+                        last_finish_chunk=last_finish_chunk,
+                        last_output_messages=last_output_messages,
+                    )
+                    parsed = parse_langgraph_chunk(chunk)
+                    stream_snapshots = None
+                    if (
+                        parsed
+                        and parsed[0] == "values"
+                        and isinstance(parsed[1], dict)
+                    ):
+                        stream_snapshots = processor.peek_turn_snapshots()
+                    for event in self._yield_events_from_chunk(
+                        chunk,
+                        processor,
+                        accumulated=accumulated,
+                        last_stream_chunk=last_stream_chunk,
+                    ):
+                        yield event
+                    if parsed and parsed[0] == "values":
+                        values_messages = (
+                            parsed[1].get("messages", [])
+                            if isinstance(parsed[1], dict)
+                            else []
+                        )
+                        if (
+                            values_messages
+                            and len(values_messages) > stream_output_count
+                            and stream_snapshots is not None
+                        ):
+                            streamed_thinking, streamed_assistant = stream_snapshots
+                            self._append_stream_values_messages(
+                                thread,
+                                append_to,
+                                values_messages,
+                                stream_output_count,
+                                streamed_thinking=streamed_thinking,
+                                streamed_assistant=streamed_assistant,
+                            )
+                            stream_output_count = len(values_messages)
+                        flush_accumulated = accumulated
+                        flush_stream_chunk = last_stream_chunk
+                        flush_finish_chunk = last_finish_chunk
+                        if stream_snapshots is not None:
+                            last_stream_snapshots = stream_snapshots
+                        accumulated, last_stream_chunk, last_finish_chunk = (
+                            self._reset_turn_stream_state()
+                        )
+            for event in self._yield_flush_events(
+                processor,
+                accumulated=flush_accumulated,
+                last_ai_message=last_ai_message,
+                last_stream_chunk=flush_stream_chunk,
+                last_finish_chunk=flush_finish_chunk,
             ):
-                (
-                    accumulated,
-                    last_ai_message,
-                    last_stream_chunk,
-                    last_finish_chunk,
-                    last_output_messages,
-                ) = self._consume_stream_chunk(
-                    chunk,
-                    internal_mode,
-                    accumulated=accumulated,
-                    last_ai_message=last_ai_message,
-                    last_stream_chunk=last_stream_chunk,
-                    last_finish_chunk=last_finish_chunk,
-                    last_output_messages=last_output_messages,
-                )
-                for event in self._yield_events_from_chunk(chunk, processor):
-                    yield event
+                yield event
         finally:
+            streamed_thinking, streamed_assistant = last_stream_snapshots
             self._finalize_stream_append(
                 thread,
                 append_to,
                 input_messages,
                 last_output_messages,
-                accumulated,
+                flush_accumulated,
                 last_ai_message,
-                last_stream_chunk,
-                last_finish_chunk,
+                flush_stream_chunk,
+                flush_finish_chunk,
+                output_messages_start_index=stream_output_count,
+                streamed_thinking=streamed_thinking,
+                streamed_assistant=streamed_assistant,
             )
 
 

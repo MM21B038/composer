@@ -3,6 +3,7 @@ import asyncio
 import json
 
 import tiktoken
+from pydantic import model_validator
 from tiktoken.core import Encoding
 
 from langchain_core.messages import (
@@ -72,7 +73,27 @@ class ImageMessage(HumanMessage):
 
 
 class AIMessage(BaseAIMessage):
-    pass
+    @model_validator(mode="after")
+    def _normalize_reasoning_content(self) -> "AIMessage":
+        from .stream import extract_assistant_text, extract_thinking
+
+        assistant_text = extract_assistant_text(self)
+        thinking_text = extract_thinking(self)
+        content = self.content
+
+        if assistant_text and not (isinstance(content, str) and content):
+            if not isinstance(content, list):
+                object.__setattr__(self, "content", assistant_text)
+            else:
+                object.__setattr__(self, "content", assistant_text)
+
+        kwargs = dict(self.additional_kwargs or {})
+        if thinking_text:
+            kwargs["reasoning_content"] = thinking_text
+        for key in ("reasoning", "thinking", "reasoning_details"):
+            kwargs.pop(key, None)
+        object.__setattr__(self, "additional_kwargs", kwargs)
+        return self
 
 
 class SystemMessage(BaseSystemMessage):
@@ -226,6 +247,12 @@ class AgentInvoke:
         if self._result is not None:
             return repr(self._result)
         return "<AgentInvoke pending>"
+
+    def _ipython_display_(self) -> None:
+        """Resolve and display in Jupyter instead of showing '<AgentInvoke pending>'."""
+        from IPython.display import display
+
+        display(self.resolve())
 
 
 class Thread:

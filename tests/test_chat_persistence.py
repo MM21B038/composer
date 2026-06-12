@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock
 
+import asyncio
 import pytest
 
 from chat.models import ChatSession as ChatSessionModel
@@ -45,6 +46,17 @@ def test_lookup_by_name(project):
     session = project.new_session(name="named")
     found = project.get_session(name="named")
     assert found.id == session.id
+
+
+def test_list_all_from_async_context():
+    async def _run() -> list[str]:
+        ChatProject.create("async-context")
+        names = [project.name for project in ChatProject.list_all()]
+        ChatProject.delete_by(name="async-context")
+        return names
+
+    names = asyncio.run(_run())
+    assert "async-context" in names
 
 
 def test_list_projects():

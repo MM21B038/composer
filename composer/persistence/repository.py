@@ -6,11 +6,12 @@ from uuid import UUID
 
 from django.db import transaction
 
-from chat.models import BranchNodeRecord, ChatSession, Project, StoredMessage
-
 from ..thread import Thread
 from ..thread_branch import ThreadBranchGraph
-from .django_setup import ensure_django
+from .django_setup import ensure_django, sync_db
+
+ensure_django()
+from chat.models import BranchNodeRecord, ChatSession, Project, StoredMessage
 from .serializers import (
     attach_branch_graph,
     branch_graph_from_session,
@@ -25,11 +26,13 @@ from .serializers import (
 
 class SessionRepository:
     @staticmethod
+    @sync_db
     def create_project(name: str) -> Project:
         ensure_django()
         return Project.objects.create(name=name)
 
     @staticmethod
+    @sync_db
     def get_project(*, id: UUID | str | None = None, name: str | None = None) -> Project:
         ensure_django()
         if id is not None:
@@ -39,11 +42,13 @@ class SessionRepository:
         raise ValueError("get_project requires id or name")
 
     @staticmethod
+    @sync_db
     def list_projects():
         ensure_django()
-        return Project.objects.all()
+        return list(Project.objects.all())
 
     @staticmethod
+    @sync_db
     def create_session(
         project: Project,
         *,
@@ -61,6 +66,7 @@ class SessionRepository:
         )
 
     @staticmethod
+    @sync_db
     def _create_session_row(
         *,
         project: Project,
@@ -79,11 +85,13 @@ class SessionRepository:
         return session
 
     @staticmethod
+    @sync_db
     def list_sessions(project: Project):
         ensure_django()
-        return project.sessions.all()
+        return list(project.sessions.all())
 
     @staticmethod
+    @sync_db
     def get_session(
         project: Project,
         *,
@@ -99,11 +107,13 @@ class SessionRepository:
         raise ValueError("get_session requires id or name")
 
     @staticmethod
+    @sync_db
     def get_session_by_id(session_id: UUID | str) -> ChatSession:
         ensure_django()
         return ChatSession.objects.select_related("project").get(pk=session_id)
 
     @staticmethod
+    @sync_db
     @transaction.atomic
     def save_session_state(
         session: ChatSession,
@@ -158,6 +168,7 @@ class SessionRepository:
             pending = remaining
 
     @staticmethod
+    @sync_db
     def load_session_state(session_id: UUID | str) -> tuple[ChatSession, Thread, ThreadBranchGraph]:
         ensure_django()
         session = SessionRepository.get_session_by_id(session_id)
@@ -172,11 +183,13 @@ class SessionRepository:
         return session, thread, graph
 
     @staticmethod
+    @sync_db
     def delete_project(project: Project) -> None:
         ensure_django()
         project.delete()
 
     @staticmethod
+    @sync_db
     def delete_session(session: ChatSession) -> None:
         ensure_django()
         session.delete()

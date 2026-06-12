@@ -4,6 +4,11 @@ from dataclasses import asdict, fields
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
+from ..stream import (
+    compact_ai_message_dump,
+    message_model_dump,
+    normalize_ai_message_dump,
+)
 from ..thread import (
     AIMessage,
     CompressedMessage,
@@ -46,7 +51,11 @@ def message_type_name(message: Message) -> str:
 
 
 def message_to_payload(message: Message) -> dict[str, Any]:
-    return message.model_dump(mode="json")
+    dump = message_model_dump(message, mode="json")
+    if isinstance(message, AIMessage):
+        dump = normalize_ai_message_dump(message, dump)
+        dump = compact_ai_message_dump(dump)
+    return dump
 
 
 def payload_to_message(data: dict[str, Any]) -> Message:
@@ -56,7 +65,12 @@ def payload_to_message(data: dict[str, Any]) -> Message:
     cls = _MESSAGE_CLASSES.get(msg_type, HumanMessage)
     dump = dict(data)
     dump["type"] = msg_type if msg_type in _MESSAGE_CLASSES else "human"
-    return cls.model_validate(dump)
+    message = cls.model_validate(dump)
+    if isinstance(message, AIMessage):
+        normalized = normalize_ai_message_dump(message, message_model_dump(message))
+        normalized = compact_ai_message_dump(normalized)
+        return AIMessage.model_validate(normalized)
+    return message
 
 
 def _rule_to_dict(rule: ToolResultHideRule) -> dict[str, Any]:
