@@ -1,6 +1,7 @@
 """Composer — thread-based agents with typed streaming."""
 
-from .persistence import ChatProject, ChatSession
+__version__ = "0.1.0"
+
 from .agent import (
     Agent,
     MCPClient,
@@ -84,3 +85,13 @@ __all__ = [
     "ChatProject",
     "ChatSession",
 ]
+
+_LAZY_IMPORTS = {"ChatProject", "ChatSession"}
+
+
+def __getattr__(name: str):
+    if name in _LAZY_IMPORTS:
+        from .persistence import ChatProject, ChatSession
+
+        return {"ChatProject": ChatProject, "ChatSession": ChatSession}[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

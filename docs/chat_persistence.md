@@ -4,14 +4,21 @@ Composer can persist chat threads and branch graphs to SQLite via Django. Use `C
 
 ## Setup
 
-Install dependencies and run migrations once:
+Install with the Django extra and run migrations once:
 
 ```bash
-uv sync
+pip install composer-agent[django]
+composer-migrate
+```
+
+From a source checkout:
+
+```bash
+uv sync --group dev
 python manage.py migrate
 ```
 
-The database file is created at `db.sqlite3` in the project root.
+By default the database file is created at `~/.composer/db.sqlite3`. Set `COMPOSER_DB_PATH` to override. In a source checkout, migrations use `db.sqlite3` in the project root instead.
 
 Django is bootstrapped automatically when you call `ChatProject` / `ChatSession` methods — you do not need to call `django.setup()` yourself.
 

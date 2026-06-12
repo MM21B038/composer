@@ -5,15 +5,15 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from chat.models import ChatSession as ChatSessionModel
-from chat.models import Project as ProjectModel
-
 from ..thread import AIMessage, Message, Thread
 from ..thread_branch import ThreadBranchGraph
 from .django_setup import ensure_django
 from .repository import SessionRepository
 
 if TYPE_CHECKING:
+    from chat.models import ChatSession as ChatSessionModel
+    from chat.models import Project as ProjectModel
+
     from ..agent import Agent
 
 

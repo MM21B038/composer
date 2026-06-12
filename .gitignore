@@ -1,10 +1,12 @@
 # Python-generated files
 __pycache__/
+.ipynb_checkpoints/
 *.py[oc]
 build/
 dist/
 wheels/
 *.egg-info
+
 
 # Virtual environments
 .venv
@@ -13,4 +15,8 @@ wheels/
 db.sqlite3
 
 # Environment variables
+<<<<<<< HEAD
 .env
+=======
+.env
+>>>>>>> d4dd27a (updated streaming, and updated packages)
