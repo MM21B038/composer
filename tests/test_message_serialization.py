@@ -1162,6 +1162,48 @@ def test_assistant_emits_on_chunk_position_last():
     assert assistant == "Streamed answer"
 
 
+def test_assistant_streams_reasoning_text_incrementally_during_thinking():
+    processor = StreamEventProcessor()
+    processor.process_message_chunk(
+        AIMessageChunk(
+            content="",
+            additional_kwargs={"reasoning_content": "Let me answer."},
+        )
+    )
+    deltas = []
+    for chunk in [
+        AIMessageChunk(
+            content="",
+            additional_kwargs={
+                "reasoning": {
+                    "type": "reasoning",
+                    "status": "in_progress",
+                    "summary": [{"type": "summary_text", "text": "think"}],
+                    "text": "Hello",
+                }
+            },
+        ),
+        AIMessageChunk(
+            content="",
+            additional_kwargs={
+                "reasoning": {
+                    "type": "reasoning",
+                    "status": "completed",
+                    "summary": [{"type": "summary_text", "text": "think"}],
+                    "text": "Hello world",
+                }
+            },
+            response_metadata={"status": "completed"},
+        ),
+    ]:
+        for event in processor.process_message_chunk(chunk):
+            if isinstance(event, AssistantEvent):
+                deltas.append(event.text)
+
+    assert deltas == ["Hello", " world"]
+    assert "".join(deltas) == "Hello world"
+
+
 def test_assistant_emits_reasoning_text_on_complete():
     processor = StreamEventProcessor()
     assistant = "".join(
@@ -1439,3 +1481,76 @@ def test_assistant_streams_incrementally_after_reasoning():
 
     assert deltas == ["Hello", " world"]
     assert "".join(deltas) == "Hello world"
+
+
+def test_streamed_assistant_not_repeated_on_values_and_flush():
+    """Regression: live stream + values + end flush must not re-print the report."""
+    processor = StreamEventProcessor(input_message_count=1)
+    processor.process_values_update({"messages": [HumanMessage("hi")]})
+    processor.process_message_chunk(
+        AIMessageChunk(
+            content="",
+            additional_kwargs={"reasoning_content": "Provide final report."},
+        )
+    )
+
+    streamed_report = (
+        "**Task Completed**\n\n"
+        "| **Method | POST |\n"
+        "The login request has been captured."
+    )
+    clean_report = (
+        "**Task Completed**\n\n"
+        "| **Method** | POST |\n"
+        "The login request has been captured."
+    )
+
+    streamed = ""
+    for text in [
+        "**Task Completed**",
+        "**Task Completed**\n\n| **Method | POST |",
+        streamed_report,
+    ]:
+        for event in processor.process_message_chunk(
+            AIMessageChunk(
+                content="",
+                additional_kwargs={
+                    "reasoning": {
+                        "type": "reasoning",
+                        "status": "in_progress",
+                        "summary": [{"type": "summary_text", "text": "think"}],
+                        "text": text,
+                    },
+                    "reasoning_content": "Provide final report.",
+                },
+                response_metadata=(
+                    {"finish_reason": "stop"} if text == streamed_report else {}
+                ),
+            )
+        ):
+            if isinstance(event, AssistantEvent):
+                streamed += event.text
+
+    final = AIMessage(
+        content=clean_report,
+        additional_kwargs={"reasoning_content": "Provide final report."},
+    )
+    values_extra = "".join(
+        event.text
+        for event in processor.process_values_update(
+            {"messages": [HumanMessage("hi"), final]}
+        )
+        if isinstance(event, AssistantEvent)
+    )
+    flush_extra = "".join(
+        event.text
+        for event in processor.flush(final)
+        if isinstance(event, AssistantEvent)
+    )
+
+    total = streamed + values_extra + flush_extra
+    assert streamed
+    assert values_extra == ""
+    assert flush_extra == ""
+    assert total.count("**Task Completed**") == 1
+    assert "The login request has been captured." in total

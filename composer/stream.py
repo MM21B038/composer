@@ -377,6 +377,8 @@ class StreamEventProcessor:
         self._reasoning_snapshot = ""
         self._assistant_snapshot = ""
         self._pending_assistant_text = ""
+        self._emitted_assistant_text = ""
+        self._assistant_content_chunk_count = 0
         self._turn_thinking_buffer = ""
         self._emitted_tool_call_ids: set[str] = set()
         self._last_chunk_fingerprint: Optional[tuple[Any, ...]] = None
@@ -552,6 +554,8 @@ class StreamEventProcessor:
         self._reasoning_snapshot = ""
         self._assistant_snapshot = ""
         self._pending_assistant_text = ""
+        self._emitted_assistant_text = ""
+        self._assistant_content_chunk_count = 0
 
     def _update_tracked_message_id(self, msg_id: Any) -> None:
         if msg_id is None or msg_id == self._tracked_ai_message_id:
@@ -579,6 +583,45 @@ class StreamEventProcessor:
         self._assistant_len = 0
         self._assistant_snapshot = ""
         self._pending_assistant_text = ""
+        self._emitted_assistant_text = ""
+        self._assistant_content_chunk_count = 0
+
+    def _note_assistant_content_chunk(self) -> None:
+        self._assistant_content_chunk_count += 1
+
+    def _assistant_delta_after_emitted(self, full: str) -> str:
+        """Return assistant text not yet yielded to the consumer."""
+        if not full:
+            return ""
+        emitted = self._emitted_assistant_text
+        if not emitted:
+            return full
+        if full.startswith(emitted):
+            return full[len(emitted) :]
+        if emitted.startswith(full):
+            return ""
+        if _same_stream_turn_content(emitted, full):
+            return ""
+        shared = _shared_prefix_len(emitted, full)
+        if shared >= _RESTREAM_PREFIX_MIN:
+            tail = min(len(emitted), len(full), 60)
+            if tail and emitted[-tail:] == full[-tail:]:
+                if len(full) > len(emitted) and full.startswith(emitted[:shared]):
+                    return full[len(emitted) :]
+                return ""
+        _, delta = merge_stream_text_delta(emitted, full)
+        if delta and (full.startswith(emitted) or emitted.startswith(full)):
+            return delta
+        return ""
+
+    def _record_emitted_assistant_delta(
+        self, delta: str, *, snapshot: str
+    ) -> None:
+        if not delta:
+            return
+        self._emitted_assistant_text += delta
+        self._assistant_snapshot = snapshot
+        self._assistant_len = len(snapshot)
 
     def _buffer_assistant_text(self, chunk: AIMessageChunk) -> None:
         incoming = extract_streaming_assistant_text(chunk)
@@ -594,15 +637,13 @@ class StreamEventProcessor:
         pending = self._pending_assistant_text
         if not pending:
             return []
-        if self._assistant_snapshot and not pending.startswith(self._assistant_snapshot):
-            self._assistant_snapshot = ""
-            self._assistant_len = 0
-        delta = pending[self._assistant_len :]
-        if not delta:
-            return []
+        delta = self._assistant_delta_after_emitted(pending)
         self._assistant_snapshot = pending
         self._assistant_len = len(pending)
         self._pending_assistant_text = ""
+        if not delta:
+            return []
+        self._record_emitted_assistant_delta(delta, snapshot=pending)
         return [AssistantEvent(text=delta, message=message, metadata=metadata)]
 
     def _chunk_fingerprint(self, chunk: AIMessageChunk) -> tuple[Any, ...]:
@@ -690,6 +731,10 @@ class StreamEventProcessor:
             return False
         if self._reasoning_snapshot:
             return True
+        if self._emitted_assistant_text:
+            return True
+        if self._assistant_content_chunk_count >= 2:
+            return True
         if _is_assistant_stream_complete(chunk):
             return True
         if getattr(self._ai_accum, "tool_call_chunks", None):
@@ -704,21 +749,19 @@ class StreamEventProcessor:
         ):
             self._clear_assistant_state()
             return []
-        incoming = extract_streaming_assistant_text(chunk)
-        if _is_assistant_stream_complete(chunk):
-            response_text = _extract_streaming_response_text(chunk)
-            for part in (incoming, response_text):
-                if part:
-                    self._extend_assistant_snapshot(part)
-        elif incoming:
-            self._extend_assistant_snapshot(incoming)
+        live_text = _extract_live_assistant_text(chunk)
+        if live_text:
+            self._note_assistant_content_chunk()
+            self._extend_assistant_snapshot(live_text)
         self._pending_assistant_text = self._assistant_snapshot
         if not self._can_stream_assistant_incrementally(chunk):
             return []
         if len(self._assistant_snapshot) <= self._assistant_len:
             return []
         delta = self._assistant_snapshot[self._assistant_len :]
-        self._assistant_len = len(self._assistant_snapshot)
+        self._record_emitted_assistant_delta(
+            delta, snapshot=self._assistant_snapshot
+        )
         return [AssistantEvent(text=delta, message=chunk, metadata=metadata)]
 
     def _reconcile_stream_lengths(self, message: Any) -> None:
@@ -761,11 +804,12 @@ class StreamEventProcessor:
     ) -> List[StreamEvent]:
         full = extract_streaming_assistant_text(message)
         self._reconcile_assistant_snapshot(full)
-        if len(full) <= self._assistant_len:
+        delta = self._assistant_delta_after_emitted(full)
+        if not delta:
+            self._assistant_snapshot = full
+            self._assistant_len = len(full)
             return []
-        delta = full[self._assistant_len :]
-        self._assistant_len = len(full)
-        self._assistant_snapshot = full
+        self._record_emitted_assistant_delta(delta, snapshot=full)
         return [AssistantEvent(text=delta, message=message, metadata=metadata)]
 
     def _record_thinking_progress(self, message: Any | None = None) -> None:
@@ -890,6 +934,21 @@ def _extract_streaming_response_text(message: Any) -> str:
             return part
 
     return ""
+
+
+def _extract_live_assistant_text(message: Any) -> str:
+    """Best-effort assistant text from a live model chunk."""
+    incoming = extract_streaming_assistant_text(message)
+    response_text = _extract_streaming_response_text(message)
+    if not incoming:
+        return response_text
+    if not response_text:
+        return incoming
+    if response_text.startswith(incoming):
+        return response_text
+    if incoming.startswith(response_text):
+        return incoming
+    return response_text if len(response_text) >= len(incoming) else incoming
 
 
 def extract_streaming_assistant_text(message: Any) -> str:

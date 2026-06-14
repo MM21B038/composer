@@ -15,8 +15,4 @@ wheels/
 db.sqlite3
 
 # Environment variables
-<<<<<<< HEAD
 .env
-=======
-.env
->>>>>>> d4dd27a (updated streaming, and updated packages)
