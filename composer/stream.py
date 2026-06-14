@@ -111,6 +111,9 @@ def _same_stream_turn_content(previous: str, incoming: str) -> bool:
         return False
     if previous == incoming:
         return True
+    # Normal incremental streaming extends or retracts the prior snapshot.
+    if previous.startswith(incoming) or incoming.startswith(previous):
+        return False
     prev_norm = _collapse_ws(previous)
     inc_norm = _collapse_ws(incoming)
     if prev_norm == inc_norm:
@@ -119,8 +122,8 @@ def _same_stream_turn_content(previous: str, incoming: str) -> bool:
         prev_norm in inc_norm or inc_norm in prev_norm
     ):
         return True
-    tail = min(len(previous), len(incoming), 40)
-    if tail and previous[-tail:] == incoming[-tail:]:
+    tail = min(len(prev_norm), len(inc_norm), 40)
+    if tail and prev_norm[-tail:] == inc_norm[-tail:]:
         return _shared_prefix_len(prev_norm, inc_norm) >= _RESTREAM_PREFIX_MIN
     return False
 
@@ -416,6 +419,7 @@ class StreamEventProcessor:
             ).get("finish_reason")
         )
         if finish_reason == "tool_calls":
+            events.extend(self._flush_unemitted_thinking_gap(message, meta))
             self._ai_accum = None
 
         return events
@@ -441,12 +445,8 @@ class StreamEventProcessor:
                 self._sync_complete_ai_message_state(message)
                 is_tool_turn = self._is_tool_turn_message(message)
                 if is_tool_turn:
-                    if self._reasoning_snapshot:
-                        self._thinking_len = len(self._reasoning_snapshot)
-                        self._turn_thinking_buffer = self._reasoning_snapshot
-                    else:
-                        events.extend(self.flush_turn_thinking(message))
-                        events.extend(self._thinking_from_complete_message(message))
+                    events.extend(self.flush_turn_thinking(message))
+                    events.extend(self._thinking_from_complete_message(message))
                     self._clear_assistant_state()
                 else:
                     events.extend(self._thinking_from_complete_message(message))
@@ -491,6 +491,20 @@ class StreamEventProcessor:
         self._reasoning_snapshot = buffer
         self._turn_thinking_buffer = buffer
         return [ThinkingEvent(text=delta, message=message, metadata={})]
+
+    def _flush_unemitted_thinking_gap(
+        self, message: Any, metadata: Dict[str, Any]
+    ) -> List[StreamEvent]:
+        """Emit thinking held in the snapshot but not yet streamed before tool_calls."""
+        if self._ai_accum is not None:
+            incoming = self._streaming_thinking_incoming(message)
+            if incoming:
+                self._extend_reasoning_snapshot(incoming)
+        gap = self._reasoning_snapshot[self._thinking_len :]
+        if not gap:
+            return []
+        self._thinking_len = len(self._reasoning_snapshot)
+        return [ThinkingEvent(text=gap, message=message, metadata=metadata)]
 
     def flush(self, message: Any) -> List[StreamEvent]:
         """Emit any remaining thinking/assistant deltas from the final message."""
@@ -640,6 +654,10 @@ class StreamEventProcessor:
 
     def _streaming_thinking_incoming(self, chunk: AIMessageChunk) -> str:
         chunk_text = _extract_streaming_thinking(chunk)
+        if chunk_text and self._reasoning_snapshot and _same_stream_turn_content(
+            self._reasoning_snapshot, chunk_text
+        ):
+            return chunk_text
         if self._ai_accum is None:
             return chunk_text
         accum_text = _extract_streaming_thinking(self._ai_accum)
@@ -652,7 +670,7 @@ class StreamEventProcessor:
         if self._reasoning_snapshot and accum_text.startswith(self._reasoning_snapshot):
             if len(accum_text) > len(chunk_text):
                 return accum_text
-        return chunk_text
+        return accum_text if len(accum_text) >= len(chunk_text) else chunk_text
 
     def _thinking_delta_from_chunk(
         self, chunk: AIMessageChunk, metadata: Dict[str, Any]
@@ -663,6 +681,20 @@ class StreamEventProcessor:
             return []
         self._thinking_len = len(self._reasoning_snapshot)
         return [ThinkingEvent(text=delta, message=chunk, metadata=metadata)]
+
+    def _can_stream_assistant_incrementally(self, chunk: AIMessageChunk) -> bool:
+        """Allow live assistant tokens during reasoning turns; defer plain preambles."""
+        if self._is_tool_turn_message(chunk) or self._is_tool_turn_message(
+            self._ai_accum
+        ):
+            return False
+        if self._reasoning_snapshot:
+            return True
+        if _is_assistant_stream_complete(chunk):
+            return True
+        if getattr(self._ai_accum, "tool_call_chunks", None):
+            return False
+        return False
 
     def _assistant_delta_from_chunk(
         self, chunk: AIMessageChunk, metadata: Dict[str, Any]
@@ -678,11 +710,10 @@ class StreamEventProcessor:
             for part in (incoming, response_text):
                 if part:
                     self._extend_assistant_snapshot(part)
-                    self._pending_assistant_text = self._assistant_snapshot
         elif incoming:
             self._extend_assistant_snapshot(incoming)
-            self._pending_assistant_text = self._assistant_snapshot
-        if not _is_assistant_stream_complete(chunk):
+        self._pending_assistant_text = self._assistant_snapshot
+        if not self._can_stream_assistant_incrementally(chunk):
             return []
         if len(self._assistant_snapshot) <= self._assistant_len:
             return []

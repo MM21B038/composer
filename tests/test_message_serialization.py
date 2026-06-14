@@ -1332,3 +1332,110 @@ def test_merge_stream_text_delta_no_tail_reemit():
     assert delta == "7"
     assert "112.1" in previous
     assert "117" in snap
+
+
+def test_cumulative_thinking_prefix_extension_streams_incrementally():
+    processor = StreamEventProcessor()
+    thinking = "".join(
+        event.text
+        for chunk in [
+            AIMessageChunk(
+                content="",
+                additional_kwargs={"reasoning_content": "We need to perform IDOR (Insecure"},
+            ),
+            AIMessageChunk(
+                content="",
+                additional_kwargs={
+                    "reasoning_content": (
+                        "We need to perform IDOR (Insecure Direct Object Reference)"
+                    )
+                },
+            ),
+        ]
+        for event in processor.process_message_chunk(chunk)
+        if isinstance(event, ThinkingEvent)
+    )
+
+    assert thinking == (
+        "We need to perform IDOR (Insecure Direct Object Reference)"
+    )
+
+
+def test_tool_calls_flushes_unemitted_thinking_gap():
+    processor = StreamEventProcessor()
+    processor.process_message_chunk(
+        AIMessageChunk(
+            content="",
+            additional_kwargs={"reasoning_content": "We need to perform IDOR (Insecure"},
+        )
+    )
+    processor._reasoning_snapshot = (
+        "We need to perform IDOR (Insecure Direct Object Reference)"
+    )
+    processor._thinking_len = len("We need to perform IDOR (Insecure")
+
+    events = processor.process_message_chunk(
+        AIMessageChunk(
+            content="",
+            tool_calls=[{"id": "c1", "name": "http", "args": {}}],
+            response_metadata={"finish_reason": "tool_calls"},
+        )
+    )
+    thinking = "".join(
+        event.text for event in events if isinstance(event, ThinkingEvent)
+    )
+
+    assert thinking == " Direct Object Reference)"
+
+
+def test_values_emits_remaining_tool_turn_thinking_after_partial_stream():
+    processor = StreamEventProcessor(input_message_count=1)
+    processor.process_values_update({"messages": [HumanMessage("hi")]})
+    processor.process_message_chunk(
+        AIMessageChunk(
+            content="",
+            additional_kwargs={"reasoning_content": "We need to perform IDOR (Insecure"},
+        )
+    )
+
+    tool_ai = AIMessage(
+        content="",
+        tool_calls=[{"id": "c1", "name": "http", "args": {}}],
+        additional_kwargs={
+            "reasoning_content": (
+                "We need to perform IDOR (Insecure Direct Object Reference)"
+            )
+        },
+    )
+    events = processor.process_values_update(
+        {"messages": [HumanMessage("hi"), tool_ai]}
+    )
+    thinking = "".join(
+        event.text for event in events if isinstance(event, ThinkingEvent)
+    )
+
+    assert thinking == " Direct Object Reference)"
+
+
+def test_assistant_streams_incrementally_after_reasoning():
+    processor = StreamEventProcessor()
+    processor.process_message_chunk(
+        AIMessageChunk(
+            content="",
+            additional_kwargs={"reasoning_content": "Let me answer."},
+        )
+    )
+    deltas = []
+    for chunk in [
+        AIMessageChunk(content="Hello"),
+        AIMessageChunk(
+            content="Hello world",
+            response_metadata={"finish_reason": "stop"},
+        ),
+    ]:
+        for event in processor.process_message_chunk(chunk):
+            if isinstance(event, AssistantEvent):
+                deltas.append(event.text)
+
+    assert deltas == ["Hello", " world"]
+    assert "".join(deltas) == "Hello world"
