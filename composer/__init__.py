@@ -22,6 +22,7 @@ from .agent import (
 )
 from .tools import run_tool_call
 from .vector import Vector
+from .parser import Parser
 from .image import ImageAttach
 from .thread import (
     Thread,
@@ -48,6 +49,7 @@ from .tool_hide import (
 __all__ = [
     "Agent",
     "Vector",
+    "Parser",
     "MCPClient",
     "MCPPromptInfo",
     "MCPResourceInfo",
