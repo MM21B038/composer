@@ -934,6 +934,7 @@ class Agent:
         stream_mode: Union[str, Sequence[str]] = "messages",
         *,
         append_to: Optional[Thread] = None,
+        record_output: bool = True,
         tools: Optional[List] = None,
         auto_tool_call: Optional[bool] = None,
     ) -> Iterator:
@@ -941,6 +942,7 @@ class Agent:
             yield from self.stream_events(
                 thread,
                 append_to=append_to,
+                record_output=record_output,
                 tools=tools,
                 auto_tool_call=auto_tool_call,
             )
@@ -952,6 +954,7 @@ class Agent:
                     thread,
                     stream_mode=stream_mode,
                     append_to=append_to,
+                    record_output=record_output,
                     tools=tools,
                     auto_tool_call=auto_tool_call,
                 ),
@@ -993,22 +996,24 @@ class Agent:
                     if out is not None:
                         yield out
         finally:
-            self._finalize_stream_append(
-                thread,
-                append_to,
-                input_messages,
-                last_output_messages,
-                accumulated,
-                last_ai_message,
-                last_stream_chunk,
-                last_finish_chunk,
-            )
+            if record_output:
+                self._finalize_stream_append(
+                    thread,
+                    append_to,
+                    input_messages,
+                    last_output_messages,
+                    accumulated,
+                    last_ai_message,
+                    last_stream_chunk,
+                    last_finish_chunk,
+                )
 
     def stream_events(
         self,
         thread: Thread,
         *,
         append_to: Optional[Thread] = None,
+        record_output: bool = True,
         tools: Optional[List] = None,
         auto_tool_call: Optional[bool] = None,
     ) -> Iterator[StreamEvent]:
@@ -1018,6 +1023,7 @@ class Agent:
                 lambda: self.astream_events(
                     thread,
                     append_to=append_to,
+                    record_output=record_output,
                     tools=tools,
                     auto_tool_call=auto_tool_call,
                 ),
@@ -1082,7 +1088,8 @@ class Agent:
                             else []
                         )
                         if (
-                            values_messages
+                            record_output
+                            and values_messages
                             and len(values_messages) > stream_output_count
                             and stream_snapshots is not None
                         ):
@@ -1112,20 +1119,21 @@ class Agent:
                 last_finish_chunk=flush_finish_chunk,
             )
         finally:
-            streamed_thinking, streamed_assistant = last_stream_snapshots
-            self._finalize_stream_append(
-                thread,
-                append_to,
-                input_messages,
-                last_output_messages,
-                flush_accumulated,
-                last_ai_message,
-                flush_stream_chunk,
-                flush_finish_chunk,
-                output_messages_start_index=stream_output_count,
-                streamed_thinking=streamed_thinking,
-                streamed_assistant=streamed_assistant,
-            )
+            if record_output:
+                streamed_thinking, streamed_assistant = last_stream_snapshots
+                self._finalize_stream_append(
+                    thread,
+                    append_to,
+                    input_messages,
+                    last_output_messages,
+                    flush_accumulated,
+                    last_ai_message,
+                    flush_stream_chunk,
+                    flush_finish_chunk,
+                    output_messages_start_index=stream_output_count,
+                    streamed_thinking=streamed_thinking,
+                    streamed_assistant=streamed_assistant,
+                )
 
     async def astream(
         self,
@@ -1133,6 +1141,7 @@ class Agent:
         stream_mode: Union[str, Sequence[str]] = "messages",
         *,
         append_to: Optional[Thread] = None,
+        record_output: bool = True,
         tools: Optional[List] = None,
         auto_tool_call: Optional[bool] = None,
     ) -> AsyncIterator:
@@ -1140,6 +1149,7 @@ class Agent:
             async for event in self.astream_events(
                 thread,
                 append_to=append_to,
+                record_output=record_output,
                 tools=tools,
                 auto_tool_call=auto_tool_call,
             ):
@@ -1180,22 +1190,24 @@ class Agent:
                     if out is not None:
                         yield out
         finally:
-            self._finalize_stream_append(
-                thread,
-                append_to,
-                input_messages,
-                last_output_messages,
-                accumulated,
-                last_ai_message,
-                last_stream_chunk,
-                last_finish_chunk,
-            )
+            if record_output:
+                self._finalize_stream_append(
+                    thread,
+                    append_to,
+                    input_messages,
+                    last_output_messages,
+                    accumulated,
+                    last_ai_message,
+                    last_stream_chunk,
+                    last_finish_chunk,
+                )
 
     async def astream_events(
         self,
         thread: Thread,
         *,
         append_to: Optional[Thread] = None,
+        record_output: bool = True,
         tools: Optional[List] = None,
         auto_tool_call: Optional[bool] = None,
     ) -> AsyncIterator[StreamEvent]:
@@ -1258,7 +1270,8 @@ class Agent:
                             else []
                         )
                         if (
-                            values_messages
+                            record_output
+                            and values_messages
                             and len(values_messages) > stream_output_count
                             and stream_snapshots is not None
                         ):
@@ -1289,20 +1302,21 @@ class Agent:
             ):
                 yield event
         finally:
-            streamed_thinking, streamed_assistant = last_stream_snapshots
-            self._finalize_stream_append(
-                thread,
-                append_to,
-                input_messages,
-                last_output_messages,
-                flush_accumulated,
-                last_ai_message,
-                flush_stream_chunk,
-                flush_finish_chunk,
-                output_messages_start_index=stream_output_count,
-                streamed_thinking=streamed_thinking,
-                streamed_assistant=streamed_assistant,
-            )
+            if record_output:
+                streamed_thinking, streamed_assistant = last_stream_snapshots
+                self._finalize_stream_append(
+                    thread,
+                    append_to,
+                    input_messages,
+                    last_output_messages,
+                    flush_accumulated,
+                    last_ai_message,
+                    flush_stream_chunk,
+                    flush_finish_chunk,
+                    output_messages_start_index=stream_output_count,
+                    streamed_thinking=streamed_thinking,
+                    streamed_assistant=streamed_assistant,
+                )
 
 
 __all__ = [

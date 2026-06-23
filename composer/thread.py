@@ -1,4 +1,4 @@
-from typing import List, Union, Optional, TYPE_CHECKING, get_args, Literal, ClassVar
+from typing import List, Union, Optional, TYPE_CHECKING, get_args, Literal, ClassVar, Iterator, AsyncIterator, Any
 import asyncio
 import json
 
@@ -34,6 +34,7 @@ from .tool_hide import (
 
 if TYPE_CHECKING:
     from .agent import Agent
+    from .stream import StreamEvent
     from .thread_branch import ThreadBranchGraph
 
 
@@ -202,7 +203,7 @@ class TokenCalculator:
 
 
 class AgentInvoke:
-    __slots__ = ("_agent", "_thread", "_append_to", "_branch", "_prepared", "_result")
+    __slots__ = ("_agent", "_thread", "_append_to", "_branch", "_prepared", "_result", "_async_prepared")
 
     def __init__(
         self,
@@ -216,21 +217,33 @@ class AgentInvoke:
         self._append_to = append_to
         self._branch = branch
         self._prepared = False
+        self._async_prepared = False
         self._result: Optional[AIMessage] = None
 
     def _prepare(self) -> None:
         if self._prepared:
             return
         if self._branch is not None:
-            self._branch.maybe_compress(self._agent)
-            self._thread = self._branch.active_view().copy()
+            self._thread = self._branch.prepare_for_agent(self._agent)
         self._prepared = True
+        self._async_prepared = True
+
+    async def _aprepare(self) -> None:
+        if self._async_prepared:
+            return
+        if self._branch is not None:
+            self._thread = await self._branch.aprepare_for_agent(self._agent)
+        self._prepared = True
+        self._async_prepared = True
 
     def __await__(self):
-        self._prepare()
-        return self._agent.ainvoke(
+        return self._await_body().__await__()
+
+    async def _await_body(self) -> AIMessage:
+        await self._aprepare()
+        return await self._agent.ainvoke(
             self._thread, append_to=self._append_to
-        ).__await__()
+        )
 
     def resolve(self) -> AIMessage:
         self._prepare()
@@ -239,6 +252,46 @@ class AgentInvoke:
                 self._thread, append_to=self._append_to
             )
         return self._result
+
+    def stream_events(self, **kwargs: Any) -> "Iterator[StreamEvent]":
+        self._prepare()
+        return self._agent.stream_events(
+            self._thread,
+            append_to=self._append_to,
+            **kwargs,
+        )
+
+    async def astream_events(self, **kwargs: Any) -> "AsyncIterator[StreamEvent]":
+        await self._aprepare()
+        async for event in self._agent.astream_events(
+            self._thread,
+            append_to=self._append_to,
+            **kwargs,
+        ):
+            yield event
+
+    def stream(self, stream_mode: Union[str, Any] = "messages", **kwargs: Any) -> Iterator:
+        self._prepare()
+        return self._agent.stream(
+            self._thread,
+            stream_mode=stream_mode,
+            append_to=self._append_to,
+            **kwargs,
+        )
+
+    async def astream(
+        self,
+        stream_mode: Union[str, Any] = "messages",
+        **kwargs: Any,
+    ) -> AsyncIterator:
+        await self._aprepare()
+        async for chunk in self._agent.astream(
+            self._thread,
+            stream_mode=stream_mode,
+            append_to=self._append_to,
+            **kwargs,
+        ):
+            yield chunk
 
     def __getattr__(self, name: str):
         return getattr(self.resolve(), name)
@@ -467,6 +520,42 @@ class Thread:
         encoder: EncoderType = "cl100k_base",
     ) -> List[int]:
         return TokenCalculator.message_counts(self, encoder)
+
+    def _agent_invoke(self, agent: "Agent") -> AgentInvoke:
+        return AgentInvoke(
+            agent,
+            self.branch.active_view().copy(),
+            self,
+            self.branch,
+        )
+
+    def stream_events(self, agent: "Agent", **kwargs: Any) -> "Iterator[StreamEvent]":
+        return self._agent_invoke(agent).stream_events(**kwargs)
+
+    async def astream_events(
+        self, agent: "Agent", **kwargs: Any
+    ) -> "AsyncIterator[StreamEvent]":
+        async for event in self._agent_invoke(agent).astream_events(**kwargs):
+            yield event
+
+    def stream(
+        self,
+        agent: "Agent",
+        stream_mode: Union[str, Any] = "messages",
+        **kwargs: Any,
+    ) -> Iterator:
+        return self._agent_invoke(agent).stream(stream_mode=stream_mode, **kwargs)
+
+    async def astream(
+        self,
+        agent: "Agent",
+        stream_mode: Union[str, Any] = "messages",
+        **kwargs: Any,
+    ) -> AsyncIterator:
+        async for chunk in self._agent_invoke(agent).astream(
+            stream_mode=stream_mode, **kwargs
+        ):
+            yield chunk
 
     # -------------------------
     # Operators

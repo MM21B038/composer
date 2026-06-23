@@ -144,6 +144,47 @@ def test_invoke_appends_to_root(project):
     assert reloaded.thread.get_messages()[-1].content == "answer"
 
 
+def test_session_stream_events_compresses_and_saves(project):
+    from composer.stream import AssistantEvent
+
+    session = project.new_session(
+        name="stream",
+        compression_prompt="summarize",
+        compression_max_tokens=10,
+        compression_tail_messages=1,
+        model_view_encoder="cl100k_base",
+    )
+    SystemMessage("sys") | session.thread
+    session.append(HumanMessage("x" * 200))
+    session.append(HumanMessage("tail"))
+
+    agent = MagicMock(spec=Agent)
+
+    def _invoke(invoke_thread, *, append_to=None, **kwargs):
+        if kwargs.get("record_output") is False:
+            return AIMessage(content="summary")
+        msg = AIMessage(content="streamed")
+        (append_to or invoke_thread).append(msg)
+        return msg
+
+    def _stream_events(invoke_thread, *, append_to=None, record_output=True, **kwargs):
+        if record_output:
+            (append_to or invoke_thread).append(AIMessage(content="streamed"))
+        yield AssistantEvent(text="streamed")
+
+    agent.invoke.side_effect = _invoke
+    agent.stream_events.side_effect = _stream_events
+
+    events = list(session.stream_events(agent))
+    assert len(events) == 1
+    assert agent.invoke.call_count == 1
+
+    reloaded = ChatSession.load(session_id=session.id)
+    assert reloaded.thread.get_messages()[-1].content == "streamed"
+    graph = reloaded.branch_graph()
+    assert graph["nodes"][graph["tail"]]["has_compressed"] is True
+
+
 def test_get_session_by_id(project):
     session = project.new_session(name="by-id")
     loaded = SessionRepository.get_session_by_id(session.id)

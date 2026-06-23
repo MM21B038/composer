@@ -155,6 +155,22 @@ Both methods:
 3. Append new messages to the root thread
 4. Save to the database (skipped for incognito)
 
+### Stream the agent
+
+```python
+# Typed events (thinking, assistant, tool_call, tool_result)
+for event in session.stream_events(agent):
+    if event.kind == "assistant":
+        print(event.text, end="")
+
+# Async
+async for event in session.astream_events(agent):
+    if event.kind == "assistant":
+        print(event.text, end="")
+```
+
+Streaming methods follow the same branch-compression and persistence lifecycle as `invoke` / `ainvoke`: they switch to the latest tail, compress when over the token limit, stream from the collapsed active view, append to the root thread, and save.
+
 ### Branch graph
 
 ```python

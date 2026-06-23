@@ -139,6 +139,69 @@ def test_maybe_compress_skips_below_limit():
     agent.invoke.assert_not_called()
 
 
+def test_maybe_compress_retries_with_shrunk_tail():
+    thread = Thread(
+        compression_prompt="summarize",
+        compression_max_tokens=15,
+        compression_tail_tokens=40,
+        model_view_encoder="cl100k_base",
+    )
+    SystemMessage("sys") | thread
+    HumanMessage("alpha " * 30) | thread
+    HumanMessage("beta " * 30) | thread
+    HumanMessage("gamma " * 30) | thread
+    HumanMessage("tail-msg") | thread
+
+    agent = MagicMock()
+    agent.invoke.return_value = AIMessage(content="summary " * 80)
+    thread.branch.maybe_compress(agent)
+    assert agent.invoke.call_count >= 1
+
+
+def test_prepare_for_agent_applies_emergency_trim_when_stuck():
+    thread = Thread(
+        compression_prompt="summarize",
+        compression_max_tokens=10,
+        compression_tail_messages=1,
+        model_view_encoder="cl100k_base",
+    )
+    SystemMessage("sys") | thread
+    HumanMessage("x" * 500) | thread
+    HumanMessage("tail") | thread
+
+    agent = _mock_agent("y" * 500)
+    with pytest.warns(UserWarning, match="emergency token trim"):
+        view = thread.branch.prepare_for_agent(agent)
+
+    assert view.max_tokens_for_model == 10
+    assert view.token_count_for_model() <= 10
+
+
+def test_amaybe_compress_uses_ainvoke():
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    thread = Thread(
+        compression_prompt="summarize",
+        compression_max_tokens=10,
+        compression_tail_messages=1,
+        model_view_encoder="cl100k_base",
+    )
+    SystemMessage("sys") | thread
+    HumanMessage("x" * 200) | thread
+    HumanMessage("tail") | thread
+
+    agent = MagicMock()
+    agent.ainvoke = AsyncMock(return_value=AIMessage(content="done"))
+
+    async def _run() -> None:
+        result = await thread.branch.amaybe_compress(agent)
+        assert result is not None
+        agent.ainvoke.assert_called_once()
+
+    asyncio.run(_run())
+
+
 def test_agent_invoke_appends_to_root_not_branch_view():
     thread = Thread(compression_prompt="summarize")
     SystemMessage("sys") | thread

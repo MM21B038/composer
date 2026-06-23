@@ -26,7 +26,7 @@ agent = Agent(model="...", base_url="...", api_key="...")
 thread = Thread()
 SystemMessage("You are a helpful assistant.") | thread
 thread.append(HumanMessage("Hello"))
-reply = thread.invoke(agent)
+reply = thread | agent
 print(reply.content)
 ```
 

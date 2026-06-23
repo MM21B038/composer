@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+import warnings
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
 
@@ -159,13 +160,84 @@ class ThreadBranchGraph:
             return node.visible_end
         return len(self.root.thread)
 
+    def _view_token_count(self) -> int:
+        return self.active_view().token_count_for_model(self.encoder)
+
+    def _is_over_limit(self) -> bool:
+        return self._view_token_count() >= self.compression_max_tokens
+
     def maybe_compress(self, agent: "Agent") -> BranchNode | None:
         if not self.compression_prompt:
             return None
-        view = self.active_view()
-        if view.token_count(self.encoder) < self.compression_max_tokens:
+        last: BranchNode | None = None
+        while self._is_over_limit():
+            child = self.compress(agent)
+            if child is None:
+                break
+            last = child
+        if self._is_over_limit():
+            retried = self._retry_with_shrunk_tail(agent)
+            if retried is not None:
+                last = retried
+        return last
+
+    async def amaybe_compress(self, agent: "Agent") -> BranchNode | None:
+        if not self.compression_prompt:
             return None
-        return self.compress(agent)
+        last: BranchNode | None = None
+        while self._is_over_limit():
+            child = await self.acompress(agent)
+            if child is None:
+                break
+            last = child
+        if self._is_over_limit():
+            retried = await self._aretry_with_shrunk_tail(agent)
+            if retried is not None:
+                last = retried
+        return last
+
+    def _retry_with_shrunk_tail(self, agent: "Agent") -> BranchNode | None:
+        if self.compression_tail_tokens is None or self.compression_tail_tokens <= 0:
+            return None
+        original = self.compression_tail_tokens
+        self.compression_tail_tokens = max(1, original // 2)
+        try:
+            if self._is_over_limit():
+                return self.compress(agent)
+        finally:
+            self.compression_tail_tokens = original
+        return None
+
+    async def _aretry_with_shrunk_tail(self, agent: "Agent") -> BranchNode | None:
+        if self.compression_tail_tokens is None or self.compression_tail_tokens <= 0:
+            return None
+        original = self.compression_tail_tokens
+        self.compression_tail_tokens = max(1, original // 2)
+        try:
+            if self._is_over_limit():
+                return await self.acompress(agent)
+        finally:
+            self.compression_tail_tokens = original
+        return None
+
+    def prepare_for_agent(self, agent: "Agent") -> "Thread":
+        self.maybe_compress(agent)
+        return self._prepared_view()
+
+    async def aprepare_for_agent(self, agent: "Agent") -> "Thread":
+        await self.amaybe_compress(agent)
+        return self._prepared_view()
+
+    def _prepared_view(self) -> "Thread":
+        view = self.active_view().copy()
+        if self.compression_prompt and self._is_over_limit():
+            warnings.warn(
+                "Active branch view still exceeds compression_max_tokens after "
+                "compression; applying emergency token trim.",
+                stacklevel=3,
+            )
+            view.max_tokens_for_model = self.compression_max_tokens
+        return view
 
     def compress(self, agent: "Agent") -> BranchNode | None:
         if not self.compression_prompt:
@@ -187,6 +259,42 @@ class ThreadBranchGraph:
             return None
 
         summary_text = self._run_compression(agent, compressible)
+        compressed_msg = CompressedMessage(content=summary_text)
+
+        new_through = content_start + len(compressible)
+        child_id = str(uuid.uuid4())
+        child = BranchNode(
+            id=child_id,
+            parent_id=self.active_id,
+            compressed=compressed_msg,
+            compressed_through=new_through,
+        )
+        active.visible_end = new_through
+        self.nodes[child_id] = child
+        active.children.append(child_id)
+        self.active_id = child_id
+        return child
+
+    async def acompress(self, agent: "Agent") -> BranchNode | None:
+        if not self.compression_prompt:
+            raise ValueError("compression_prompt is required to compress")
+
+        active = self.active
+        content_start = active.compressed_through
+        root_msgs = self.root.thread
+
+        if content_start >= len(root_msgs):
+            return None
+
+        candidates = root_msgs[content_start:]
+        if not candidates:
+            return None
+
+        compressible, _tail = self._split_tail(candidates)
+        if not compressible:
+            return None
+
+        summary_text = await self._arun_compression(agent, compressible)
         compressed_msg = CompressedMessage(content=summary_text)
 
         new_through = content_start + len(compressible)
@@ -271,7 +379,29 @@ class ThreadBranchGraph:
             record_output=False,
             system_prompt_override=prompt,
         )
-        content = result.content
+        return self._compression_result_to_text(result.content)
+
+    async def _arun_compression(self, agent: "Agent", messages: list[Message]) -> str:
+        from .thread import Thread
+
+        prompt = self.compression_prompt
+        assert prompt is not None
+        formatted = self._format_messages_for_compression(messages)
+        compress_thread = Thread(
+            [
+                SystemMessage(prompt),
+                HumanMessage(content=formatted),
+            ]
+        )
+        result = await agent.ainvoke(
+            compress_thread,
+            record_output=False,
+            system_prompt_override=prompt,
+        )
+        return self._compression_result_to_text(result.content)
+
+    @staticmethod
+    def _compression_result_to_text(content: object) -> str:
         if isinstance(content, str):
             return content
         if isinstance(content, list):
