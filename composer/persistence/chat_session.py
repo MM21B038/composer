@@ -293,6 +293,16 @@ class ChatSession:
             "nodes": nodes,
         }
 
+    def _agent_invoke(self, agent: Agent):
+        from ..thread import AgentInvoke
+
+        return AgentInvoke(
+            agent,
+            self._thread.branch.active_view().copy(),
+            self._thread,
+            self._graph,
+        )
+
     def invoke(self, agent: Agent) -> AIMessage:
         ensure_django()
         self.continue_from_tail(save=False)
@@ -303,32 +313,55 @@ class ChatSession:
             if "async context" in str(exc):
                 raise
 
-        from ..thread import AgentInvoke
-
-        pending = AgentInvoke(
-            agent,
-            self._thread.branch.active_view().copy(),
-            self._thread,
-            self._graph,
-        )
-        result = pending.resolve()
+        result = self._agent_invoke(agent).resolve()
         self.save()
         return result
 
     async def ainvoke(self, agent: Agent) -> AIMessage:
         ensure_django()
         self.continue_from_tail(save=False)
-        from ..thread import AgentInvoke
-
-        pending = AgentInvoke(
-            agent,
-            self._thread.branch.active_view().copy(),
-            self._thread,
-            self._graph,
-        )
-        result = await pending
+        result = await self._agent_invoke(agent)
         self.save()
         return result
+
+    def stream_events(self, agent: Agent, **kwargs):
+        ensure_django()
+        self.continue_from_tail(save=False)
+        try:
+            for event in self._agent_invoke(agent).stream_events(**kwargs):
+                yield event
+        finally:
+            self.save()
+
+    async def astream_events(self, agent: Agent, **kwargs):
+        ensure_django()
+        self.continue_from_tail(save=False)
+        try:
+            async for event in self._agent_invoke(agent).astream_events(**kwargs):
+                yield event
+        finally:
+            self.save()
+
+    def stream(self, agent: Agent, stream_mode="messages", **kwargs):
+        ensure_django()
+        self.continue_from_tail(save=False)
+        try:
+            yield from self._agent_invoke(agent).stream(
+                stream_mode=stream_mode, **kwargs
+            )
+        finally:
+            self.save()
+
+    async def astream(self, agent: Agent, stream_mode="messages", **kwargs):
+        ensure_django()
+        self.continue_from_tail(save=False)
+        try:
+            async for chunk in self._agent_invoke(agent).astream(
+                stream_mode=stream_mode, **kwargs
+            ):
+                yield chunk
+        finally:
+            self.save()
 
     def __repr__(self) -> str:
         if self._incognito:
