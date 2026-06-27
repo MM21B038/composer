@@ -31,7 +31,20 @@ _PREVIEW_CHARS = 200
 
 @dataclass
 class ToolResultHideRule:
-    """Rule for collapsing older tool results when sending context to the model."""
+    """Rule for collapsing older tool results when sending context to the model.
+
+    ``tool_name`` is matched against the full MCP tool name (e.g.
+    ``butcher_browser_snapshot``) using :func:`fnmatch.fnmatch` when the pattern
+    contains wildcards (``*``, ``?``, ``[...]``).
+
+    Examples:
+        - ``"butcher_browser_snapshot"`` — exact match
+        - ``"butcher_request_*"`` — all tools starting with ``butcher_request_``
+        - ``"butcher_*_snapshot"`` — any butcher tool ending in ``_snapshot``
+        - ``"*"`` — every tool (or every tool on ``server`` when set)
+        - ``server="butcher", tool_name="request_*"`` — same as ``butcher_request_*``
+        - ``server="butcher", tool_name="*"`` — all ``butcher_*`` tools
+    """
 
     tool_name: str
     on_hide_message: OnHideMessage | None = (
@@ -80,6 +93,7 @@ def split_hide_rules_by_mode(
 
 
 def resolve_full_tool_name(server: str | None, tool_name: str) -> str:
+    """Build the fnmatch pattern for a rule, prefixing ``server_`` when needed."""
     if server and tool_name != "*" and not tool_name.startswith(f"{server}_"):
         return f"{server}_{tool_name}"
     return tool_name
@@ -90,6 +104,7 @@ def tool_message_name(message: BaseToolMessage) -> str:
 
 
 def message_matches_rule(message: BaseToolMessage, rule: ToolResultHideRule) -> bool:
+    """Return whether a tool message matches a hide rule (supports fnmatch wildcards)."""
     name = tool_message_name(message)
     if not name:
         return False
@@ -101,7 +116,7 @@ def message_matches_rule(message: BaseToolMessage, rule: ToolResultHideRule) -> 
         prefix = f"{rule.server}_"
         return name.startswith(prefix)
 
-    if "*" in pattern or "?" in pattern or "[" in pattern:
+    if set(pattern) & {"*", "?", "["}:
         return fnmatch.fnmatch(name, pattern)
 
     return name == pattern

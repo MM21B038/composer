@@ -255,19 +255,21 @@ class Agent:
         if build_client is not None:
             model.client = build_client()
 
-    def _invalidate_mcp_tools(self, tools: Optional[Any] = None) -> None:
-        for mcp in self._collect_mcp_clients(tools):
-            mcp._tools = None
-
     async def _prepare_thread_loop_context(self, tools: Optional[Any] = None) -> None:
         self._reset_loop_bound_clients()
         for mcp in self._collect_mcp_clients(tools):
-            mcp._tools = None
-            await mcp.load_tools(reload=True)
+            await mcp.ensure_connected()
+            await mcp.get_tools()
+
+    async def _cleanup_thread_loop_context_async(
+        self, tools: Optional[Any] = None
+    ) -> None:
+        self._reset_loop_bound_clients()
+        for mcp in self._collect_mcp_clients(tools):
+            await mcp.disconnect()
 
     def _cleanup_thread_loop_context(self, tools: Optional[Any] = None) -> None:
         self._reset_loop_bound_clients()
-        self._invalidate_mcp_tools(tools)
 
     def _sync_run_async(self, coro, *, tools: Optional[Any] = None):
         if not _in_running_loop():
@@ -277,7 +279,10 @@ class Agent:
 
         async def wrapped() -> Any:
             await self._prepare_thread_loop_context(tools)
-            return await coro
+            try:
+                return await coro
+            finally:
+                await self._cleanup_thread_loop_context_async(tools)
 
         def runner() -> None:
             try:
@@ -308,6 +313,7 @@ class Agent:
                 except Exception as exc:
                     item_queue.put(("err", exc))
                 finally:
+                    await self._cleanup_thread_loop_context_async(tools)
                     item_queue.put(("done", _ASYNC_GEN_SENTINEL))
 
             def runner() -> None:

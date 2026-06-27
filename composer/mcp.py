@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
@@ -7,6 +9,10 @@ from langchain_core.documents.base import Blob
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.prompts import load_mcp_prompt
+from langchain_mcp_adapters.resources import load_mcp_resources
+from langchain_mcp_adapters.tools import load_mcp_tools
+from mcp import ClientSession
 
 Message = Union[HumanMessage, AIMessage]
 
@@ -29,7 +35,11 @@ class MCPResourceInfo:
 
 
 class MCPClient:
-    """Composer wrapper around MultiServerMCPClient — use server config dicts, not raw JSON blobs."""
+    """Composer wrapper around MultiServerMCPClient — use server config dicts, not raw JSON blobs.
+
+    For stdio transports, call ``await mcp.connect()`` (or ``async with mcp``) so tool
+    calls reuse one server process and in-memory MCP state is preserved across calls.
+    """
 
     def __init__(
         self,
@@ -48,10 +58,21 @@ class MCPClient:
         self._tools: Optional[List[BaseTool]] = None
         self._prompts: Optional[List[MCPPromptInfo]] = None
         self._resources: Optional[List[MCPResourceInfo]] = None
+        self._exit_stack: Optional[AsyncExitStack] = None
+        self._sessions: Dict[str, ClientSession] = {}
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     @property
     def client(self) -> MultiServerMCPClient:
         return self._client
+
+    @property
+    def connected(self) -> bool:
+        return bool(self._sessions)
+
+    @property
+    def sessions(self) -> Dict[str, ClientSession]:
+        return dict(self._sessions)
 
     @property
     def loaded(self) -> bool:
@@ -90,9 +111,65 @@ class MCPClient:
             )
         return self._resources
 
+    async def connect(self) -> None:
+        """Open one persistent MCP session per configured server."""
+        if not self._client.connections or self._sessions:
+            return
+
+        stack = AsyncExitStack()
+        sessions: Dict[str, ClientSession] = {}
+        try:
+            for server_name in self._client.connections:
+                session = await stack.enter_async_context(
+                    self._client.session(server_name)
+                )
+                sessions[server_name] = session
+        except Exception:
+            await stack.aclose()
+            raise
+
+        self._exit_stack = stack
+        self._sessions = sessions
+        self._loop = asyncio.get_running_loop()
+        self._invalidate_catalog_cache()
+
+    async def disconnect(self) -> None:
+        """Close all persistent MCP sessions."""
+        if self._exit_stack is not None:
+            await self._exit_stack.aclose()
+        self._exit_stack = None
+        self._sessions = {}
+        self._loop = None
+        self._invalidate_catalog_cache()
+
+    async def ensure_connected(self) -> None:
+        """Connect, or reconnect when the running event loop changed."""
+        loop = asyncio.get_running_loop()
+        if self._sessions and self._loop is not None and self._loop is not loop:
+            await self.disconnect()
+        if not self._sessions:
+            await self.connect()
+
+    async def __aenter__(self) -> MCPClient:
+        await self.connect()
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        await self.disconnect()
+
+    def _invalidate_catalog_cache(self) -> None:
+        self._tools = None
+        self._prompts = None
+        self._resources = None
+
     async def get_tools(self, *, reload: bool = False) -> List[BaseTool]:
+        if not self._client.connections:
+            self._tools = []
+            return self._tools
+
+        await self.ensure_connected()
         if self._tools is None or reload:
-            self._tools = await self._client.get_tools()
+            self._tools = await self._load_tools_from_sessions()
         return self._tools
 
     async def load_tools(self, *, reload: bool = False) -> List[BaseTool]:
@@ -126,11 +203,8 @@ class MCPClient:
     ) -> List[Message]:
         """Fetch a prompt by name. Resolves server from the loaded prompt catalog when omitted."""
         resolved_server = server or self._resolve_prompt_server(name)
-        return await self._client.get_prompt(
-            resolved_server,
-            name,
-            arguments=arguments,
-        )
+        session = await self._session_for(resolved_server)
+        return await load_mcp_prompt(session, name, arguments=arguments)
 
     async def get_resource(
         self,
@@ -140,10 +214,32 @@ class MCPClient:
     ) -> List[Blob]:
         """Fetch resource content by URI. Resolves server from the loaded resource catalog when omitted."""
         resolved_server = server or self._resolve_resource_server(uri)
-        return await self._client.get_resources(
-            server_name=resolved_server,
-            uris=uri,
-        )
+        session = await self._session_for(resolved_server)
+        return await load_mcp_resources(session, uris=uri)
+
+    async def _session_for(self, server_name: str) -> ClientSession:
+        await self.ensure_connected()
+        try:
+            return self._sessions[server_name]
+        except KeyError as exc:
+            known = list(self._client.connections.keys())
+            raise ValueError(
+                f"Unknown MCP server {server_name!r}. Expected one of {known or '(none)'}"
+            ) from exc
+
+    async def _load_tools_from_sessions(self) -> List[BaseTool]:
+        tools: List[BaseTool] = []
+        for server_name, session in self._sessions.items():
+            tools.extend(
+                await load_mcp_tools(
+                    session,
+                    callbacks=self._client.callbacks,
+                    server_name=server_name,
+                    tool_interceptors=self._client.tool_interceptors,
+                    tool_name_prefix=self._client.tool_name_prefix,
+                )
+            )
+        return tools
 
     def _resolve_prompt_server(self, name: str) -> str:
         if self._prompts is None:
@@ -185,35 +281,35 @@ class MCPClient:
 
     async def _list_prompts(self) -> List[MCPPromptInfo]:
         prompts: List[MCPPromptInfo] = []
-        for server_name in self._client.connections:
-            async with self._client.session(server_name) as session:
-                result = await session.list_prompts()
-                for prompt in result.prompts:
-                    prompts.append(
-                        MCPPromptInfo(
-                            name=prompt.name,
-                            server=server_name,
-                            description=prompt.description,
-                            arguments=list(prompt.arguments) if prompt.arguments else None,
-                        )
+        await self.ensure_connected()
+        for server_name, session in self._sessions.items():
+            result = await session.list_prompts()
+            for prompt in result.prompts:
+                prompts.append(
+                    MCPPromptInfo(
+                        name=prompt.name,
+                        server=server_name,
+                        description=prompt.description,
+                        arguments=list(prompt.arguments) if prompt.arguments else None,
                     )
+                )
         return prompts
 
     async def _list_resources(self) -> List[MCPResourceInfo]:
         resources: List[MCPResourceInfo] = []
-        for server_name in self._client.connections:
-            async with self._client.session(server_name) as session:
-                result = await session.list_resources()
-                for resource in result.resources:
-                    resources.append(
-                        MCPResourceInfo(
-                            uri=str(resource.uri),
-                            server=server_name,
-                            name=resource.name,
-                            description=resource.description,
-                            mime_type=resource.mimeType,
-                        )
+        await self.ensure_connected()
+        for server_name, session in self._sessions.items():
+            result = await session.list_resources()
+            for resource in result.resources:
+                resources.append(
+                    MCPResourceInfo(
+                        uri=str(resource.uri),
+                        server=server_name,
+                        name=resource.name,
+                        description=resource.description,
+                        mime_type=resource.mimeType,
                     )
+                )
         return resources
 
     def __repr__(self) -> str:
@@ -222,5 +318,6 @@ class MCPClient:
         resource_count = len(self._resources) if self._resources else "?"
         return (
             f"MCPClient(servers={list(self._client.connections.keys())}, "
+            f"connected={self.connected}, "
             f"tools={tool_count}, prompts={prompt_count}, resources={resource_count})"
         )

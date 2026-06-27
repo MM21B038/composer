@@ -35,6 +35,44 @@ def test_message_matches_whole_server():
     assert not message_matches_rule(_tool("task_manager_create", "a"), rule)
 
 
+def test_message_matches_request_prefix_pattern():
+    rule = ToolResultHideRule(tool_name="butcher_request_*")
+    assert message_matches_rule(_tool("butcher_request_snapshot", "a"), rule)
+    assert message_matches_rule(_tool("butcher_request_submit", "a"), rule)
+    assert not message_matches_rule(_tool("butcher_browser_snapshot", "a"), rule)
+
+
+def test_message_matches_server_plus_partial_pattern():
+    rule = ToolResultHideRule(server="butcher", tool_name="request_*")
+    assert message_matches_rule(_tool("butcher_request_foo", "a"), rule)
+    assert not message_matches_rule(_tool("butcher_browser_foo", "a"), rule)
+
+
+def test_message_matches_all_tools():
+    rule = ToolResultHideRule(tool_name="*")
+    assert message_matches_rule(_tool("butcher_request_foo", "a"), rule)
+    assert message_matches_rule(_tool("task_manager_create", "a"), rule)
+
+
+def test_wildcard_hides_matching_tools_only():
+    thread = Thread(
+        tool_hide_rules=[
+            ToolResultHideRule(
+                tool_name="butcher_request_*",
+                on_hide_message="[hidden]",
+            )
+        ]
+    )
+    thread.append(_tool("butcher_request_a", "first", "1"))
+    thread.append(_tool("butcher_request_b", "second", "2"))
+    thread.append(_tool("butcher_browser_snap", "visible", "3"))
+
+    tool_contents = [
+        m.content for m in thread.messages_for_model() if isinstance(m, ToolMessage)
+    ]
+    assert tool_contents == ["[hidden]", "second", "visible"]
+
+
 def test_keep_latest_one():
     thread = Thread(
         tool_hide_rules=[
